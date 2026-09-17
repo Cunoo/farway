@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:farway/screens/home.dart'; // Import vašej domovskej stránky
+import 'package:farway/screens/profile.dart';
+import 'package:farway/screens/world.dart';
 
 class MainTabBar extends StatefulWidget {
   const MainTabBar({super.key});
@@ -13,8 +15,8 @@ class _MainTabBarState extends State<MainTabBar> {
 
   final List<Widget> _screens = [
     const HomePage(),
-    const Center(child: Icon(Icons.search, size: 100, color: Colors.green)), // Druhá záložka
-    const Center(child: Icon(Icons.person, size: 100, color: Colors.orange)), // Tretia záložka
+    const WorldPage(),
+    const ProfilePage(),
   ];
 
   @override
@@ -31,7 +33,7 @@ class _MainTabBarState extends State<MainTabBar> {
         },
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.home), label: 'Home'),
-          BottomNavigationBarItem(icon: Icon(Icons.search), label: 'Search'),
+          BottomNavigationBarItem(icon: Icon(Icons.map), label: 'World'),
           BottomNavigationBarItem(icon: Icon(Icons.person), label: 'Profile'),
         ],
       ),

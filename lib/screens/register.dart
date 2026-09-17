@@ -15,8 +15,6 @@ class _RegisterPageState extends State<RegisterPage> with AuthUiHelper {
   final _passwordController = TextEditingController();
   final AuthService _authService = AuthService();
   
-  bool _isLoading = false;
-
   @override
   void dispose() {
     _emailController.dispose();
