@@ -4,6 +4,7 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:farway/navigation/destination_search.dart';
+import 'package:farway/navigation/free_mode_controller.dart';
 import 'package:farway/navigation/route_navigation.dart';
 import 'package:farway/ui/app_colors.dart';
 import 'package:flutter/material.dart';
@@ -36,6 +37,7 @@ class _WorldPageState extends State<WorldPage> {
   static const _tracklogMinDistanceM = 8.0; // minimálny posun v metroch pre nový bod v tracklogu
   LatLng? _lastTracklogLatLng;
   List<List<LatLng>> _historicalLines = [];
+  final FreeModeController _freeController = FreeModeController();
 
   final _mapController = MapController();
 
@@ -227,7 +229,48 @@ List<LatLng> _parseGeoJsonCoordinates(dynamic coords) {
 
   return result;
 }
+Future<void> _handleTripCompletion() async {
+  if (_isFinishing || _route == null) return;
+  setState(() => _isFinishing = true);
 
+  try {
+    // 1. Získaj dáta z existujúceho stavu v _WorldState
+    final double distanceKm = _actualDrivenMeters / 1000.0;
+    final int durationSeconds = _route!.totalSeconds.round();
+    
+    // _actualTracklog už ukladá [lat, lon], takže ho pošli priamo
+    final tracklogJson = _actualTracklog;
+
+    // 2. Volanie Supabase RPC funkcie
+    final response = await Supabase.instance.client.rpc(
+      'save_trip_and_calculate_xp',
+      params: {
+        'p_distance_km': distanceKm,
+        'p_duration_seconds': durationSeconds,
+        'p_tracklog': tracklogJson,
+      },
+    );
+
+    debugPrint('Ukončená jazda, výsledok RPC: $response');
+
+    // 3. Okamžite načítaj novovytvorené modré čiary na mape
+    await _fetchHistoricalTracks();
+
+    // 4. Upratovanie stavu v UI
+    if (mounted) {
+      _resetNavigation();
+    }
+  } catch (e) {
+    debugPrint('Chyba pri ukončovaní: $e');
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Chyba pri ukladaní trasy: $e')),
+      );
+    }
+  } finally {
+    if (mounted) setState(() => _isFinishing = false);
+  }
+}
   void _setCurrentPosition(Position position) {
       if (!mounted) return;
       
@@ -237,7 +280,7 @@ List<LatLng> _parseGeoJsonCoordinates(dynamic coords) {
         _currentCoords = currentLatLng;
         if (position.heading >= 0) _heading = position.heading;
 
-        if (_navigationStarted) {
+        if (_navigationStarted || _freeController.isFreeMode) {
           if (_lastRecordedPosition != null) {
             final distance = const Distance().as(
               LengthUnit.Meter,
@@ -250,13 +293,12 @@ List<LatLng> _parseGeoJsonCoordinates(dynamic coords) {
           }
           _lastRecordedPosition = currentLatLng;
 
-          // Pridaj do tracklogu len pri posune >= 8 metrov
           if (_lastTracklogLatLng == null ||
             const Distance().as(LengthUnit.Meter, _lastTracklogLatLng!, currentLatLng) >= _tracklogMinDistanceM) {
             _actualTracklog.add([currentLatLng.latitude, currentLatLng.longitude]);
             _lastTracklogLatLng = currentLatLng;
-            }
-        }
+          }
+}
       });
 
       if (_mapReady) _mapController.move(_currentCoords!, 15);
@@ -288,13 +330,13 @@ List<LatLng> _parseGeoJsonCoordinates(dynamic coords) {
     final stepDist = const Distance()(previous, nextCoords);
     _actualDrivenMeters += stepDist;
 
-    if (_navigationStarted) {
+    if (_navigationStarted || _freeController.isFreeMode) {
       if (_lastTracklogLatLng == null ||
           const Distance().as(LengthUnit.Meter, _lastTracklogLatLng!, nextCoords) >= _tracklogMinDistanceM) {
         _actualTracklog.add([nextCoords.latitude, nextCoords.longitude]);
         _lastTracklogLatLng = nextCoords;
       }
-    }
+}
 
     setState(() {
       _currentCoords = nextCoords;
@@ -310,6 +352,59 @@ List<LatLng> _parseGeoJsonCoordinates(dynamic coords) {
     if (result == null || !mounted) return;
     debugPrint('Vybraná ulica: ${result.name} (${result.point})');
     await _fetchRoute(origin, result.point);
+  }
+
+  void _startFreeModeSession() {
+  setState(() {
+    _resetNavigation();
+    _freeController.start();
+  });
+  }
+
+  Future<void> _handleFreeModeCompletion() async {
+    if (_isFinishing || !_freeController.isFreeMode) return;
+    setState(() => _isFinishing = true);
+
+    try {
+      final response = await _freeController.finishAndSave(
+        actualDrivenMeters: _actualDrivenMeters,
+        actualTracklog: _actualTracklog,
+      );
+
+      debugPrint('Free mód ukončený, XP/výsledok: $response');
+      await _fetchHistoricalTracks();
+
+      if (mounted) {
+        await showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => AlertDialog(
+            backgroundColor: AppColors.surface,
+            title: const Text('Prieskum ukončený!', style: TextStyle(color: AppColors.white)),
+            content: Text(
+              'Prešli ste ${(_actualDrivenMeters / 1000).toStringAsFixed(2)} km vo voľnom móde.',
+              style: const TextStyle(color: Colors.white70),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                  setState(() {
+                    _resetNavigation();
+                    _freeController.reset();
+                  });
+                },
+                child: const Text('OK'),
+              ),
+            ],
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('Chyba pri ukladaní free módu: $e');
+    } finally {
+      if (mounted) setState(() => _isFinishing = false);
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -395,6 +490,7 @@ List<LatLng> _parseGeoJsonCoordinates(dynamic coords) {
   /// Vola sa pri kazdej zmene polohy.
 /// Vola sa pri kazdej zmene polohy.
   void _updateNavigation() {
+    if (_freeController.isFreeMode) return;
     final route = _route;
     final position = _currentCoords;
     if (route == null || position == null || _routeLoading) return;
@@ -681,7 +777,16 @@ List<LatLng> _parseGeoJsonCoordinates(dynamic coords) {
               onPressed: _openDestinationSearch,
             ),
           ),
-          
+          Positioned(
+            top: MediaQuery.paddingOf(context).top + 70,
+            right: 20,
+            child: _MapButton(
+              icon: _freeController.isFreeMode ? Icons.stop : Icons.explore,
+              onPressed: _freeController.isFreeMode
+                  ? _handleFreeModeCompletion
+                  : _startFreeModeSession,
+            ),
+          ),
           // Zobraz horný navigačný panel iba ak navigácia už začala
           if (route != null && progress != null && _navigationStarted)
             Positioned(
@@ -710,14 +815,50 @@ List<LatLng> _parseGeoJsonCoordinates(dynamic coords) {
               bottom: 24,
               child: _DebugDPad(onMove: _moveSimulated),
             ),
+            
+            if (_freeController.isFreeMode)
             Positioned(
-              right: 20,
-              bottom: 24,
-              child: _MapButton(
-                icon: Icons.my_location,
-                onPressed: _currentCoords == null || !_mapReady
-                    ? null
-                    : () => _mapController.move(_currentCoords!, 15),
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: Align(
+                alignment: Alignment.bottomCenter,
+                child: Material(
+                  color: AppColors.surface,
+                  elevation: 16,
+                  borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+                  child: SafeArea(
+                    top: false,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(20, 24, 20, 16),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text(
+                            'Voľný prieskum mesta',
+                            style: TextStyle(color: AppColors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            'Prešlo sa: ${(_actualDrivenMeters / 1000).toStringAsFixed(2)} km',
+                            style: const TextStyle(color: Colors.white70, fontSize: 14),
+                          ),
+                          const SizedBox(height: 24),
+                          ElevatedButton(
+                            onPressed: _handleFreeModeCompletion,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AppColors.teal,
+                              foregroundColor: AppColors.background,
+                              padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 32),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                            ),
+                            child: const Text('Ukončiť prieskum', style: TextStyle(fontWeight: FontWeight.bold)),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
               ),
             ),
           ],

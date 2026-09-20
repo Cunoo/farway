@@ -1,10 +1,10 @@
 // lib/navigation/route_navigation.dart
 //
-// Cista Dart logika navigacie (bez Flutter widgetov):
-//  - zlozi trasu z riadkov, ktore vracia route_with_points_directed
-//  - vypocita pokyny na odbocenie (vlavo/vpravo/...)
-//  - priradi GPS polohu k trase (zostavajuca vzdialenost, cas, dalsi pokyn)
-//  - zisti, ci je pouzivatel mimo trasy
+// Pure Dart navigation logic (without Flutter widgets):
+//  - assembles a route from lines returned by route_with_points_directed
+//  - calculates turn-by-turn instructions (left/right/...)
+//  - maps GPS location to the route (remaining distance, time, next instruction)
+//  - detects if the user is off-route
 
 import 'dart:convert';
 import 'dart:math' as math;
@@ -13,14 +13,14 @@ import 'package:latlong2/latlong.dart';
 
 const Distance _distance = Distance();
 
-// Prepocet stupnov na metre (priblizne, pre kratke vzdialenosti).
+// Conversion of degrees to meters (approximate, for short distances).
 const double _metersPerDegree = 111195;
 
-// Ako daleko dopredu/dozadu sa pozerame pri vypocte smeru odbocky.
+// How far ahead/back we look when calculating the turn direction.
 const double _lookAroundMeters = 15;
 
 // ---------------------------------------------------------------------------
-// Pokyny
+// Instructions
 // ---------------------------------------------------------------------------
 
 enum TurnType {
