@@ -45,33 +45,33 @@ class Maneuver {
 
   final TurnType type;
 
-  /// Vzdialenost od zaciatku trasy, kde sa pokyn vykona.
+  /// Distance from the start of the route where the maneuver takes place.
   final double atMeters;
 
-  /// Nazov ulice, na ktoru sa odbocuje ('' ak nema nazov).
+  /// Name of the road being turned onto ('' if unnamed).
   final String roadName;
 
   String get text {
-    final on = roadName.isEmpty ? '' : ' na $roadName';
+    final on = roadName.isEmpty ? '' : ' onto $roadName';
     return switch (type) {
       TurnType.depart =>
-        roadName.isEmpty ? 'Vyrazte' : 'Vyrazte po $roadName',
+        roadName.isEmpty ? 'Depart' : 'Depart onto $roadName',
       TurnType.straight =>
-        roadName.isEmpty ? 'Pokračujte rovno' : 'Pokračujte po $roadName',
-      TurnType.slightLeft => 'Mierne doľava$on',
-      TurnType.left => 'Odbočte doľava$on',
-      TurnType.sharpLeft => 'Ostro doľava$on',
-      TurnType.slightRight => 'Mierne doprava$on',
-      TurnType.right => 'Odbočte doprava$on',
-      TurnType.sharpRight => 'Ostro doprava$on',
-      TurnType.uTurn => 'Otočte sa$on',
-      TurnType.arrive => 'Ste v cieli',
+        roadName.isEmpty ? 'Continue straight' : 'Continue on $roadName',
+      TurnType.slightLeft => 'Slight left$on',
+      TurnType.left => 'Turn left$on',
+      TurnType.sharpLeft => 'Sharp left$on',
+      TurnType.slightRight => 'Slight right$on',
+      TurnType.right => 'Turn right$on',
+      TurnType.sharpRight => 'Sharp right$on',
+      TurnType.uTurn => 'Make a u-turn$on',
+      TurnType.arrive => 'You have arrived',
     };
   }
 }
 
 // ---------------------------------------------------------------------------
-// Postup po trase
+// Route Progress
 // ---------------------------------------------------------------------------
 
 class RouteProgress {
@@ -85,25 +85,25 @@ class RouteProgress {
     required this.toNextM,
   });
 
-  /// Poloha pouzivatela premietnuta na trasu.
+  /// User location snapped to the route.
   final LatLng snapped;
 
-  /// Kolko metrov od zaciatku trasy uz presiel.
+  /// Meters traveled from the start of the route.
   final double alongM;
 
-  /// Ako daleko od trasy je (metre).
+  /// Distance off the route in meters.
   final double offRouteM;
 
   final double remainingM;
   final double remainingS;
 
-  /// Najblizsi nasledujuci pokyn (null, ak uz nie je ziadny).
+  /// Nearest upcoming maneuver (null if none remaining).
   final Maneuver? next;
   final double toNextM;
 }
 
 // ---------------------------------------------------------------------------
-// Trasa
+// Route Data
 // ---------------------------------------------------------------------------
 
 class _Step {
@@ -135,10 +135,10 @@ class RouteData {
     required List<_Step> steps,
   }) : _steps = steps;
 
-  /// Cela trasa ako jedna suvisla ciara v smere jazdy.
+  /// Full route as a single continuous polyline in driving direction.
   final List<LatLng> points;
 
-  /// cumulative[i] = vzdialenost v metroch od zaciatku trasy po points[i].
+  /// cumulative[i] = distance in meters from start to points[i].
   final List<double> cumulative;
 
   final List<Maneuver> maneuvers;
@@ -147,8 +147,8 @@ class RouteData {
   double get totalMeters => cumulative.last;
   double get totalSeconds => _steps.fold(0.0, (sum, s) => sum + s.durationS);
 
-  /// Zlozi trasu z riadkov RPC route_with_points_directed.
-  /// Vrati null, ak riadky neobsahuju pouzitelnu geometriu.
+  /// Assembles route from route_with_points_directed RPC rows.
+  /// Returns null if rows do not contain usable geometry.
   static RouteData? tryParse(List<Map> rows) {
     final sorted = [...rows]
       ..sort((a, b) => _asDouble(a['seq']).compareTo(_asDouble(b['seq'])));
@@ -160,7 +160,7 @@ class RouteData {
       final line = parseGeometry(row['geom']);
       if (line.length < 2) continue;
 
-      // Ak sa usek napaja na koniec predchadzajuceho, spolocny bod nevkladame 2x.
+      // Avoid duplicating shared point when connecting segments.
       final skip =
           points.isNotEmpty && _distance(points.last, line.first) < 2 ? 1 : 0;
       final startIdx = skip == 1 ? points.length - 1 : points.length;
@@ -191,11 +191,10 @@ class RouteData {
     );
   }
 
-  /// Premietne polohu na trasu a vypocita postup.
+  /// Projects position onto the route and calculates progress.
   ///
-  /// [hintMeters] je posledny znamy postup: hladame najprv len v okoli neho,
-  /// aby sa poloha neprilepila na iny usek, ak trasa prechadza tym istym
-  /// miestom dvakrat.
+  /// [hintMeters] is the last known progress: search around it first
+  /// to prevent snapping to overlapping route segments.
   RouteProgress project(LatLng position, {double hintMeters = 0}) {
     var hit = _nearest(position, hintMeters - 50, hintMeters + 400);
     if (hit == null || hit.distanceM > 40) {
@@ -243,7 +242,7 @@ class RouteData {
     for (var i = 0; i < points.length - 1; i++) {
       if (cumulative[i + 1] < minM || cumulative[i] > maxM) continue;
 
-      // Lokalna rovinna sustava v metroch so stredom v polohe pouzivatela.
+      // Local planar coordinate system in meters centered at user position.
       final ax = (points[i].longitude - p.longitude) * cosLat * _metersPerDegree;
       final ay = (points[i].latitude - p.latitude) * _metersPerDegree;
       final bx =
@@ -277,7 +276,7 @@ class RouteData {
   }
 
   // -------------------------------------------------------------------------
-  // Pokyny na odbocenie
+  // Turn Maneuvers
   // -------------------------------------------------------------------------
 
   static List<Maneuver> _buildManeuvers(
@@ -290,7 +289,7 @@ class RouteData {
     ];
 
     for (var i = 1; i < steps.length; i++) {
-      final j = steps[i].startIdx; // index bodu, kde sa useky stretavaju
+      final j = steps[i].startIdx; // index of junction point
       final k = _walk(pts, j, -1);
       final m = _walk(pts, j, 1);
       if (k == j || m == j) continue;
@@ -303,7 +302,7 @@ class RouteData {
       final nameChanged =
           steps[i].name.isNotEmpty && steps[i].name != steps[i - 1].name;
 
-      // Rovno po tej istej ulici nie je potrebny pokyn.
+      // Straight continuation on the same road requires no maneuver.
       if (type == TurnType.straight && !nameChanged) continue;
 
       result.add(
@@ -317,8 +316,8 @@ class RouteData {
     return result;
   }
 
-  /// Ide od bodu [from] v smere [dir] (+1 / -1), kym nie je aspon
-  /// _lookAroundMeters daleko. Ak sa nedostane dost daleko, vrati posledny bod.
+  /// Walks from [from] in direction [dir] (+1 / -1) until at least
+  /// _lookAroundMeters away. Returns last point if limit not reached.
   static int _walk(List<LatLng> pts, int from, int dir) {
     var i = from;
     while (true) {
@@ -339,7 +338,7 @@ class RouteData {
     return TurnType.uTurn;
   }
 
-  /// Smer z bodu a do bodu b v stupnoch (0 = sever, v smere hodinovych ruciciek).
+  /// Bearing from point a to point b in degrees (0 = north, clockwise).
   static double _bearing(LatLng a, LatLng b) {
     final lat1 = a.latitudeInRad;
     final lat2 = b.latitudeInRad;
@@ -350,21 +349,21 @@ class RouteData {
     return math.atan2(y, x) * 180 / math.pi;
   }
 
-  /// Uhol do rozsahu (-180, 180].
+  /// Normalizes angle to range (-180, 180].
   static double _normalize(double degrees) {
-    var x = degrees % 360; // v Darte je vysledok vzdy >= 0
+    var x = degrees % 360; // Dart modulo is always >= 0
     if (x > 180) x -= 360;
     return x;
   }
 }
 
 // ---------------------------------------------------------------------------
-// Pomocne funkcie
+// Helper Functions
 // ---------------------------------------------------------------------------
 
 double _asDouble(dynamic v) => v is num ? v.toDouble() : 0.0;
 
-/// Prevedie GeoJSON (text alebo mapu) na zoznam bodov.
+/// Converts GeoJSON (string or map) to list of points.
 List<LatLng> parseGeometry(dynamic geometry) {
   if (geometry is String) {
     try {
@@ -392,8 +391,8 @@ List<LatLng> parseGeometry(dynamic geometry) {
 }
 
 LatLng? _toLatLng(dynamic c) {
-  if (c is! List || c.length < 2 || c[0] is! num || c[1] is! num) return null;
-  return LatLng((c[1] as num).toDouble(), (c[0] as num).toDouble());
+  if (c is! List || c.length < 2 || c[0] is! num || c is! num) return null;
+  return LatLng((c as num).toDouble(), (c[0] as num).toDouble());
 }
 
 /// 180 -> "180 m", 1450 -> "1.5 km"

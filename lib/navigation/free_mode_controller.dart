@@ -7,32 +7,32 @@ class FreeModeController {
   bool get isFreeMode => _isFreeMode;
   int get elapsedSeconds => _stopwatch.elapsed.inSeconds;
 
-  /// Zapnutie voľného režimu
+  /// Start free mode
   void start() {
     _isFreeMode = true;
     _stopwatch.reset();
     _stopwatch.start();
   }
 
-  /// Zastavenie/pozastavenie voľného režimu
+  /// Stop/pause free mode
   void stop() {
     _isFreeMode = false;
     _stopwatch.stop();
   }
 
-  /// Úplný reset stavu
+  /// Full reset of the state
   void reset() {
     _isFreeMode = false;
     _stopwatch.reset();
   }
 
-  /// Ukončenie, odoslanie dát do Supabase a vyčistenie
+  /// Finish, send data to Supabase and clean up
   Future<dynamic> finishAndSave({
     required double actualDrivenMeters,
     required List<List<double>> actualTracklog,
   }) async {
     final double distanceKm = actualDrivenMeters / 1000.0;
-    // Poistka proti 0 sekundám pri okamžitom kliknutí
+    // Safety check against 0 seconds on instant click
     const int minDuration = 1;
     final int durationSeconds = elapsedSeconds > 0 ? elapsedSeconds : minDuration;
 

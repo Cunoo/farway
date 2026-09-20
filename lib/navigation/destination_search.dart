@@ -1,8 +1,8 @@
 // lib/navigation/destination_search.dart
 //
-// Vyhladavaci popup, ktory sa vysunie zhora. Pouzivatel zada nazov ulice,
-// vysledky sa nacitavaju z databazy (RPC search_streets) a zoradene su
-// podla toho, ako daleko su od neho.
+// Top-sheet search popup. User enters a street name,
+// results are fetched from the database (RPC search_streets) and sorted
+// by distance from the user.
 
 import 'dart:async';
 import 'dart:math' as math;
@@ -24,14 +24,14 @@ class StreetResult {
   final String name;
   final String roadType;
 
-  /// Cielovy bod (lezi na ceste).
+  /// Destination point (lies on the road).
   final LatLng point;
 
-  /// Vzdialenost od pouzivatela v metroch.
+  /// Distance from the user in meters.
   final double distanceM;
 }
 
-/// Otvori popup zhora. Vrati vybranu ulicu, alebo null, ak ho pouzivatel zavrel.
+/// Opens the top popup. Returns the selected street, or null if closed by the user.
 Future<StreetResult?> showDestinationSearch(
   BuildContext context, {
   required LatLng origin,
@@ -73,7 +73,7 @@ class _DestinationSearch extends StatefulWidget {
 class _DestinationSearchState extends State<_DestinationSearch> {
   final _controller = TextEditingController();
   Timer? _debounce;
-  int _requestId = 0; // aby sa starsia odpoved neprepisala novsiu
+  int _requestId = 0; // prevents older responses from overwriting newer ones
 
   String _query = '';
   List<StreetResult> _results = [];
@@ -92,7 +92,7 @@ class _DestinationSearchState extends State<_DestinationSearch> {
     final query = value.trim();
 
     if (query.length < 2) {
-      _requestId++; // zrus pripadne rozbehnute hladanie
+      _requestId++; // cancel any ongoing search
       setState(() {
         _query = query;
         _results = [];
@@ -152,10 +152,10 @@ class _DestinationSearchState extends State<_DestinationSearch> {
       });
     } catch (error) {
       if (!mounted || requestId != _requestId) return;
-      debugPrint('Chyba pri hľadaní ulice: $error');
+      debugPrint('Street search error: $error');
       setState(() {
         _loading = false;
-        _error = 'Hľadanie sa nepodarilo. Skúste to znova.';
+        _error = 'Search failed. Please try again.';
       });
     }
   }
@@ -165,7 +165,7 @@ class _DestinationSearchState extends State<_DestinationSearch> {
   @override
   Widget build(BuildContext context) {
     final media = MediaQuery.of(context);
-    // Zvysok obrazovky nad klavesnicou, aby zoznam nikdy netrcal za klavesnicu.
+    // Remaining screen space above keyboard to ensure list never overflows.
     final maxListHeight = math.max(
       120.0,
       media.size.height - media.viewInsets.bottom - media.padding.top - 140,
@@ -198,7 +198,7 @@ class _DestinationSearchState extends State<_DestinationSearch> {
                           if (_results.isNotEmpty) _select(_results.first);
                         },
                         decoration: InputDecoration(
-                          hintText: 'Kam chcete ísť? Zadajte ulicu',
+                          hintText: 'Where to? Enter street name',
                           hintStyle: const TextStyle(color: Colors.white54),
                           prefixIcon: const Icon(
                             Icons.search,
@@ -254,11 +254,11 @@ class _DestinationSearchState extends State<_DestinationSearch> {
 
   List<Widget> _buildBody(double maxHeight) {
     if (_query.length < 2) {
-      return const [_Hint('Zadajte aspoň 2 znaky názvu ulice.')];
+      return const [_Hint('Enter at least 2 characters of the street name.')];
     }
     if (_error != null) return [_Hint(_error!, isError: true)];
     if (_results.isEmpty) {
-      return [if (!_loading) const _Hint('Nenašla sa žiadna ulica.')];
+      return [if (!_loading) const _Hint('No streets found.')];
     }
 
     return [
@@ -283,7 +283,7 @@ class _DestinationSearchState extends State<_DestinationSearch> {
                 style: const TextStyle(color: AppColors.white),
               ),
               subtitle: Text(
-                '${formatDistance(result.distanceM)} od vás',
+                '${formatDistance(result.distanceM)} away',
                 style: const TextStyle(color: Colors.white60),
               ),
               onTap: () => _select(result),
