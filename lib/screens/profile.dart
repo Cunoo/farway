@@ -301,3 +301,137 @@ class _ErrorView extends StatelessWidget {
         ),
       );
 }
+
+
+class _RegionsProgressSection extends StatelessWidget {
+  const _RegionsProgressSection({required this.regionsFuture});
+
+  final Future<List<Map<String, dynamic>>> regionsFuture;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          '// REGION_PROGRESS',
+          style: TextStyle(
+            color: AppColors.textSecondary,
+            fontFamily: 'monospace',
+            fontSize: 12,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Container(
+          decoration: BoxDecoration(
+            color: AppColors.panel,
+            border: Border.all(color: AppColors.border),
+            borderRadius: BorderRadius.circular(20),
+          ),
+          child: FutureBuilder<List<Map<String, dynamic>>>(
+            future: regionsFuture,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Center(
+                    child: CircularProgressIndicator(color: AppColors.teal),
+                  ),
+                );
+              }
+              if (snapshot.hasError) {
+                return Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(
+                    'Chyba načítania regiónov',
+                    style: TextStyle(color: AppColors.danger),
+                  ),
+                );
+              }
+              final regions = snapshot.data ?? [];
+              if (regions.isEmpty) {
+                return const Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Text(
+                    'Žiadne dáta regiónov.',
+                    style: TextStyle(color: AppColors.textSecondary),
+                  ),
+                );
+              }
+              return ListView.separated(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: regions.length,
+                separatorBuilder: (_, __) => const Divider(
+                  height: 1,
+                  color: AppColors.border,
+                ),
+                itemBuilder: (context, index) {
+                  final reg = regions[index];
+                  final name = reg['name'] ?? 'Neznámy región';
+                  final percent = (reg['percent'] as num?)?.toDouble() ?? 0.0;
+                  final cleared = (reg['cleared_km'] as num?)?.toDouble() ?? 0.0;
+                  final total = (reg['total_road_km'] as num?)?.toDouble() ?? 0.0;
+
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 12,
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Expanded(
+                              child: Text(
+                                name,
+                                style: const TextStyle(
+                                  color: AppColors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 14,
+                                ),
+                              ),
+                            ),
+                            Text(
+                              '${percent.toStringAsFixed(1)}%',
+                              style: const TextStyle(
+                                color: AppColors.tealLight,
+                                fontFamily: 'monospace',
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 6),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(4),
+                          child: LinearProgressIndicator(
+                            value: (percent / 100.0).clamp(0.0, 1.0),
+                            minHeight: 6,
+                            backgroundColor: AppColors.surface,
+                            color: AppColors.teal,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '${cleared.toStringAsFixed(1)} / ${total.toStringAsFixed(1)} km',
+                          style: const TextStyle(
+                            color: AppColors.textSecondary,
+                            fontFamily: 'monospace',
+                            fontSize: 10,
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+}

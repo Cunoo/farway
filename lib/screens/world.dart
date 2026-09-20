@@ -1,3 +1,5 @@
+// lib/navigation/world.dart
+
 import 'dart:async';
 import 'dart:math' as math;
 
@@ -28,6 +30,12 @@ class _WorldPageState extends State<WorldPage> {
   static const _offRouteUpdates = 3; // kolko po sebe iducich aktualizacii
   static const _rerouteCooldown = Duration(seconds: 8);
   static const _arrivalThresholdM = 15.0;
+  double _actualDrivenMeters = 0.0;
+  LatLng? _lastRecordedPosition;
+  final List<List<double>> _actualTracklog = [];
+  static const _tracklogMinDistanceM = 8.0; // minimálny posun v metroch pre nový bod v tracklogu
+  LatLng? _lastTracklogLatLng;
+  List<List<LatLng>> _historicalLines = [];
 
   final _mapController = MapController();
 
@@ -46,6 +54,8 @@ class _WorldPageState extends State<WorldPage> {
   RouteProgress? _progress;
   int _offRouteCount = 0;
   DateTime? _lastReroute;
+  bool _navigationStarted = false; // Nový stav: čaká sa na potvrdenie navigácie
+  bool _isFinishing = false;
 
   String? get _mapTilesUrl {
     final styleUrl = dotenv.env['PUBLIC_MAPTILER_DARK_TILE_URL'];
@@ -61,6 +71,7 @@ class _WorldPageState extends State<WorldPage> {
   void initState() {
     super.initState();
     _refreshLocation();
+    _fetchHistoricalTracks();
   }
 
   @override
@@ -139,17 +150,119 @@ class _WorldPageState extends State<WorldPage> {
       if (mounted) setState(() => _loading = false);
     }
   }
+Future<void> _fetchHistoricalTracks() async {
+  try {
+    final userId = Supabase.instance.client.auth.currentUser?.id;
+    if (userId == null) return;
 
-  void _setCurrentPosition(Position position) {
-    if (!mounted) return;
-    setState(() {
-      _currentCoords = LatLng(position.latitude, position.longitude);
-      if (position.heading >= 0) _heading = position.heading;
-    });
-    if (_mapReady) _mapController.move(_currentCoords!, 15);
-    _updateNavigation();
+    final dynamic response = await Supabase.instance.client.rpc(
+      'get_user_cleared_geometries',
+      params: {'p_user_id': userId},
+    );
+
+    List<dynamic> geometriesList = [];
+    if (response is List) {
+      if (response.isNotEmpty &&
+          response.first is Map &&
+          response.first.containsKey('get_user_cleared_geometries')) {
+        geometriesList =
+            response.first['get_user_cleared_geometries'] as List? ?? [];
+      } else {
+        geometriesList = response;
+      }
+    } else if (response is Map &&
+        response.containsKey('get_user_cleared_geometries')) {
+      geometriesList =
+          response['get_user_cleared_geometries'] as List? ?? [];
+    }
+
+    final lines = <List<LatLng>>[];
+    for (final item in geometriesList) {
+      if (item is Map) {
+        final points = _parseGeoJsonCoordinates(item['coordinates']);
+        if (points.isNotEmpty) lines.add(points);
+      }
+    }
+    setState(() => _historicalLines = lines);
+    debugPrint('Načítaných modrých čiar: ${_historicalLines.length}');
+  } catch (e) {
+    debugPrint('Chyba načítania vyčistených ciest: $e');
+  }
+}
+
+List<LatLng> _parseGeoJsonCoordinates(dynamic coords) {
+  final result = <LatLng>[];
+  if (coords is! List) return result;
+
+  // Zistenie, či ide o MultiLineString (3 úrovne vnoru) alebo LineString (2 úrovne)
+  final isMulti = coords.isNotEmpty &&
+                  coords.first is List &&
+                  coords.first.isNotEmpty &&
+                  coords.first.first is List;
+
+  void addPt(dynamic pt) {
+    if (pt is List && pt.length >= 2) {
+      final lon = pt[0];
+      final lat = pt[1];
+      if (lon is num && lat is num) {
+        // Flutter latlong2 vyžaduje poradie: (lat, lon)
+        result.add(LatLng(lat.toDouble(), lon.toDouble()));
+      }
+    }
   }
 
+  if (isMulti) {
+    for (final line in coords) {
+      if (line is List) {
+        for (final pt in line) {
+          addPt(pt);
+        }
+      }
+    }
+  } else {
+    for (final pt in coords) {
+      addPt(pt);
+    }
+  }
+
+  return result;
+}
+
+  void _setCurrentPosition(Position position) {
+      if (!mounted) return;
+      
+      final currentLatLng = LatLng(position.latitude, position.longitude);
+
+      setState(() {
+        _currentCoords = currentLatLng;
+        if (position.heading >= 0) _heading = position.heading;
+
+        if (_navigationStarted) {
+          if (_lastRecordedPosition != null) {
+            final distance = const Distance().as(
+              LengthUnit.Meter,
+              _lastRecordedPosition!,
+              currentLatLng,
+            );
+            if (distance > 0 && distance < 150) { 
+              _actualDrivenMeters += distance;
+            }
+          }
+          _lastRecordedPosition = currentLatLng;
+
+          // Pridaj do tracklogu len pri posune >= 8 metrov
+          if (_lastTracklogLatLng == null ||
+            const Distance().as(LengthUnit.Meter, _lastTracklogLatLng!, currentLatLng) >= _tracklogMinDistanceM) {
+            _actualTracklog.add([currentLatLng.latitude, currentLatLng.longitude]);
+            _lastTracklogLatLng = currentLatLng;
+            }
+        }
+      });
+
+      if (_mapReady) _mapController.move(_currentCoords!, 15);
+      _updateNavigation();
+    }
+    
   void _moveSimulated(String direction) {
     if (!_useSimulatedLocation) return;
     final headingOffset = switch (direction) {
@@ -171,11 +284,23 @@ class _WorldPageState extends State<WorldPage> {
       previous.longitude + longitudeStep,
     );
 
+    // Výpočet a zápis prejdenej vzdialenosti
+    final stepDist = const Distance()(previous, nextCoords);
+    _actualDrivenMeters += stepDist;
+
+    if (_navigationStarted) {
+      if (_lastTracklogLatLng == null ||
+          const Distance().as(LengthUnit.Meter, _lastTracklogLatLng!, nextCoords) >= _tracklogMinDistanceM) {
+        _actualTracklog.add([nextCoords.latitude, nextCoords.longitude]);
+        _lastTracklogLatLng = nextCoords;
+      }
+    }
+
     setState(() {
-      _heading = nextHeading;
       _currentCoords = nextCoords;
+      _heading = nextHeading;
     });
-    if (_mapReady) _mapController.move(nextCoords, 15);
+    
     _updateNavigation();
   }
 
@@ -213,6 +338,7 @@ class _WorldPageState extends State<WorldPage> {
         _route = null;
         _progress = null;
         _routeLines = [];
+        _navigationStarted = false; // Reset štartu pri novej trase
       }
     });
     if (reroute) _lastReroute = DateTime.now();
@@ -267,6 +393,7 @@ class _WorldPageState extends State<WorldPage> {
   }
 
   /// Vola sa pri kazdej zmene polohy.
+/// Vola sa pri kazdej zmene polohy.
   void _updateNavigation() {
     final route = _route;
     final position = _currentCoords;
@@ -277,6 +404,29 @@ class _WorldPageState extends State<WorldPage> {
       hintMeters: _progress?.alongM ?? 0,
     );
 
+    // Výpočet orezania červenej čiary za vozidlom, ak už navigácia beží
+    List<List<LatLng>> updatedLines = _routeLines;
+    if (_navigationStarted) {
+      int startIndex = 0;
+      for (int i = 0; i < route.cumulative.length; i++) {
+        if (route.cumulative[i] >= progress.alongM) {
+          startIndex = math.max(0, i - 1);
+          break;
+        }
+      }
+      updatedLines = [[progress.snapped, ...route.points.skip(startIndex)]];
+    }
+
+    setState(() {
+      _progress = progress;
+      if (_navigationStarted) {
+        _routeLines = updatedLines;
+      }
+    });
+
+    // Kým nie je navigácia aktívne odštartovaná, nevyhodnocujeme príchod do cieľa ani prepočítavanie trasy
+    if (!_navigationStarted) return;
+
     if (progress.remainingM < _arrivalThresholdM) {
       _finishNavigation();
       return;
@@ -285,7 +435,6 @@ class _WorldPageState extends State<WorldPage> {
     _offRouteCount = progress.offRouteM > _offRouteThresholdM
         ? _offRouteCount + 1
         : 0;
-    setState(() => _progress = progress);
 
     final destination = _routeDestination;
     final last = _lastReroute;
@@ -300,23 +449,138 @@ class _WorldPageState extends State<WorldPage> {
       _fetchRoute(position, destination, reroute: true);
     }
   }
+  Future<void> _finishNavigation() async {
+    if (_route == null || _isFinishing) return;
+    _isFinishing = true;
+    
+    final distanceKm = _actualDrivenMeters / 1000.0;
+    
+    try {
+      debugPrint('PAYLOAD CHECK -> distance: $distanceKm, duration: ${_route!.totalSeconds}, tracklog: $_actualTracklog');
 
-  void _finishNavigation() {
-    _cancelNavigation();
-    if (!mounted) return;
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('Ste v cieli.')));
+      final response = await Supabase.instance.client.rpc(
+        'save_trip_and_calculate_xp',
+        params: {
+          'p_distance_km': distanceKm,
+          'p_duration_seconds': _route!.totalSeconds.round(),
+          'p_tracklog': _actualTracklog,
+        },
+      );
+
+      int earnedXp = 0;
+      double newClearedKm = 0.0;
+
+      if (response is List && response.isNotEmpty) {
+        final row = response.first;
+        earnedXp = (row['earned_xp'] as num?)?.toInt() ?? 0;
+        newClearedKm = (row['new_cleared_km'] as num?)?.toDouble() ?? 0.0;
+      }
+
+      if (mounted) {
+        await showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => AlertDialog(
+            backgroundColor: AppColors.surface,
+            title: const Text('Jazda dokončená!', style: TextStyle(color: AppColors.white)),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Získané XP: +$earnedXp', style: const TextStyle(color: AppColors.tealLight)),
+                const SizedBox(height: 6),
+                Text('Nové objavené km: ${newClearedKm.toStringAsFixed(2)} km', style: const TextStyle(color: AppColors.white)),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  Navigator.of(ctx).pop(); // zatvor dialog
+                  _resetNavigation(); // vymaž trasu a resetuj stav namiesto popu root stránky
+                },
+                child: const Text('OK'),
+              ),
+            ],
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('Chyba pri ukladaní trasy: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Chyba pri ukladaní trasy: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isFinishing = false);
+      } else {
+        _isFinishing = false;
+      }
+    }
   }
 
-  void _cancelNavigation() {
+
+  void _resetNavigation() {
     setState(() {
       _route = null;
       _progress = null;
       _routeLines = [];
       _routeDestination = null;
       _offRouteCount = 0;
+      _navigationStarted = false;
+      _isFinishing = false;
+      
+      _actualDrivenMeters = 0.0;
+      _lastRecordedPosition = null;
+      _lastTracklogLatLng = null;
+      _actualTracklog.clear();
     });
+  }
+    Future<void> _cancelNavigation() async {
+    // Ak používateľ ešte ani neodštartoval alebo prešiel menej ako 300 metrov, zrušíme to bez pýtania
+    if (!_navigationStarted || _actualDrivenMeters < 300) {
+      _resetNavigation();
+      return;
+    }
+
+    // Ak prešiel dostatočnú vzdialenosť, opýtame sa ho, čo chce spraviť
+    final distanceKm = (_actualDrivenMeters / 1000.0).toStringAsFixed(2);
+
+    final action = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text(
+          'Ukončiť jazdu?',
+          style: TextStyle(color: AppColors.white),
+        ),
+        content: Text(
+          'Prešli ste $distanceKm km. Chcete túto časť trasy uložiť a získať za ňu XP?',
+          style: const TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop('discard'),
+            child: const Text('Zahodiť', style: TextStyle(color: AppColors.danger)),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop('save'),
+            style: ElevatedButton.styleFrom(backgroundColor: AppColors.teal),
+            child: const Text('Uložiť a pripísať XP', style: TextStyle(color: AppColors.background)),
+          ),
+        ],
+      ),
+    );
+
+    if (action == 'save') {
+      // Ak vybral uložiť, zavoláme dokončenie trasy (ktoré pošle dáta do DB)
+      await _finishNavigation();
+    } else if (action == 'discard') {
+      // Ak vybral zahodiť, všetko vymažeme
+      _resetNavigation();
+    }
   }
 
   @override
@@ -360,6 +624,24 @@ class _WorldPageState extends State<WorldPage> {
                     Polyline(points: line, color: Colors.red, strokeWidth: 5),
                 ],
               ),
+              PolylineLayer(
+                polylines: [
+                  // 1. Modré historické cesty
+                  for (final line in _historicalLines)
+                    Polyline(
+                      points: line,
+                      color: Colors.green.withValues(alpha: 0.5),
+                      strokeWidth: 4,
+                    ),
+                  // 2. Aktuálna červená trasa
+                  for (final line in _routeLines)
+                    Polyline(
+                      points: line,
+                      color: Colors.red,
+                      strokeWidth: 5,
+                    ),
+                ],
+              ),
               MarkerLayer(
                 markers: [
                   Marker(
@@ -390,6 +672,7 @@ class _WorldPageState extends State<WorldPage> {
               ),
             ],
           ),
+          
           Positioned(
             top: MediaQuery.paddingOf(context).top + 12,
             right: 20,
@@ -398,7 +681,9 @@ class _WorldPageState extends State<WorldPage> {
               onPressed: _openDestinationSearch,
             ),
           ),
-          if (route != null && progress != null)
+          
+          // Zobraz horný navigačný panel iba ak navigácia už začala
+          if (route != null && progress != null && _navigationStarted)
             Positioned(
               top: MediaQuery.paddingOf(context).top + 12,
               left: 16,
@@ -410,27 +695,51 @@ class _WorldPageState extends State<WorldPage> {
                 onCancel: _cancelNavigation,
               ),
             ),
+            
           if (_routeLoading)
             Positioned(
               top: MediaQuery.paddingOf(context).top + 110,
               left: 20,
               child: const CircularProgressIndicator(color: Colors.red),
             ),
-          Positioned(
-            left: 16,
-            bottom: 24,
-            child: _DebugDPad(onMove: _moveSimulated),
-          ),
-          Positioned(
-            right: 20,
-            bottom: 24,
-            child: _MapButton(
-              icon: Icons.my_location,
-              onPressed: _currentCoords == null || !_mapReady
-                  ? null
-                  : () => _mapController.move(_currentCoords!, 15),
+            
+          // Skry D-Pad a MyLocation tlačidlo, ak sme v režime prezerania náhľadu trasy (aby nezavadzali spodnej lište)
+          if (_route == null || _navigationStarted) ...[
+            Positioned(
+              left: 16,
+              bottom: 24,
+              child: _DebugDPad(onMove: _moveSimulated),
             ),
-          ),
+            Positioned(
+              right: 20,
+              bottom: 24,
+              child: _MapButton(
+                icon: Icons.my_location,
+                onPressed: _currentCoords == null || !_mapReady
+                    ? null
+                    : () => _mapController.move(_currentCoords!, 15),
+              ),
+            ),
+          ],
+
+          // Zobraz spodnú lištu pre náhľad trasy a odhad XP (pred štartom)
+          if (route != null && !_navigationStarted)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: _RouteSummaryPanel(
+                route: route,
+                onStart: () {
+                  setState(() => _navigationStarted = true);
+                  if (_currentCoords != null && _mapReady) {
+                    _mapController.move(_currentCoords!, 17); // Zazoomuje bližšie pri štarte
+                  }
+                },
+                onCancel: _cancelNavigation,
+              ),
+            ),
+
           const Positioned(
             left: 8,
             bottom: 8,
@@ -441,6 +750,150 @@ class _WorldPageState extends State<WorldPage> {
           ),
         ],
       ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------
+// Widgety pre UI prvky mapy
+// ---------------------------------------------------------------------
+
+class _RouteSummaryPanel extends StatelessWidget {
+  const _RouteSummaryPanel({
+    required this.route,
+    required this.onStart,
+    required this.onCancel,
+  });
+
+  final RouteData route;
+  final VoidCallback onStart;
+  final VoidCallback onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    // Vypočet odhadovaných XP: min = 1 XP/km (ak prešiel všetko), max = 2 XP/km (ak je všetko nové)
+    final distanceKm = route.totalMeters / 1000;
+    final minXp = (distanceKm * 1).round();
+    final maxXp = (distanceKm * 2).round();
+
+    return Align(
+      alignment: Alignment.bottomCenter,
+      child: Material(
+        color: AppColors.surface,
+        elevation: 16,
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        child: SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 24, 20, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceAround,
+                  children: [
+                    _SummaryItem(
+                      icon: Icons.route,
+                      value: formatDistance(route.totalMeters),
+                      label: 'Vzdialenosť',
+                    ),
+                    _SummaryItem(
+                      icon: Icons.timer,
+                      value: formatDuration(route.totalSeconds),
+                      label: 'Odhad',
+                    ),
+                    _SummaryItem(
+                      icon: Icons.star_rounded,
+                      value: '$minXp - $maxXp XP',
+                      label: 'Odmena',
+                      iconColor: Colors.amber,
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 24),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: onCancel,
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: AppColors.white,
+                          side: const BorderSide(color: Colors.white24),
+                          padding: const EdgeInsets.symmetric(vertical: 16),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                        ),
+                        child: const Text('Zrušiť'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      flex: 2,
+                      child: ElevatedButton(
+                        onPressed: onStart,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.teal,
+                          foregroundColor: AppColors.background,
+                          padding: const EdgeInsets.symmetric(vertical: 16),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                        ),
+                        child: const Text(
+                          'Štart navigácie',
+                          style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SummaryItem extends StatelessWidget {
+  const _SummaryItem({
+    required this.icon,
+    required this.value,
+    required this.label,
+    this.iconColor = AppColors.teal,
+  });
+
+  final IconData icon;
+  final String value;
+  final String label;
+  final Color iconColor;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, color: iconColor, size: 28),
+        const SizedBox(height: 8),
+        Text(
+          value,
+          style: const TextStyle(
+            color: AppColors.white,
+            fontSize: 16,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          style: const TextStyle(color: Colors.white60, fontSize: 12),
+        ),
+      ],
     );
   }
 }
