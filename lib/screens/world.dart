@@ -1,18 +1,24 @@
-// lib/navigation/world.dart
+// lib/screens/world.dart
 
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:farway/navigation/navigation_controller.dart';
+import 'package:farway/navigation/trip_recorder.dart';
 import 'package:farway/navigation/destination_search.dart';
 import 'package:farway/navigation/free_mode_controller.dart';
 import 'package:farway/navigation/route_navigation.dart';
+import 'package:farway/navigation/tracks_repository.dart';
+import 'package:farway/navigation/trip_repository.dart';
 import 'package:farway/ui/app_colors.dart';
+import 'package:farway/ui/navigation_panel.dart';
+import 'package:farway/ui/route_summary_panel.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
+import '../ui/world_controls.dart';
 
 class WorldPage extends StatefulWidget {
   const WorldPage({super.key});
@@ -26,18 +32,11 @@ class _WorldPageState extends State<WorldPage> {
   static const _simulationStep = 0.0001;
   static const _useSimulatedLocation = true;
 
-  // Navigation settings
-  static const _offRouteThresholdM = 30.0; // distance threshold considered off-route
-  static const _offRouteUpdates = 3; // consecutive updates required
-  static const _rerouteCooldown = Duration(seconds: 8);
-  static const _arrivalThresholdM = 15.0;
-  double _actualDrivenMeters = 0.0;
-  LatLng? _lastRecordedPosition;
-  final List<List<double>> _actualTracklog = [];
-  static const _tracklogMinDistanceM = 8.0; // minimum movement in meters for a new tracklog point
-  LatLng? _lastTracklogLatLng;
-  List<List<LatLng>> _historicalLines = [];
   final FreeModeController _freeController = FreeModeController();
+  final NavigationController _navController = NavigationController();
+  final TripRecorder _tripRecorder = TripRecorder();
+  final _tracksRepository = const TracksRepository();
+  final _tripRepository = const TripRepository();
 
   final _mapController = MapController();
 
@@ -46,17 +45,11 @@ class _WorldPageState extends State<WorldPage> {
   bool _loading = true;
   bool _mapReady = false;
   String? _error;
-  LatLng? _routeDestination;
   List<List<LatLng>> _routeLines = [];
-  bool _routeLoading = false;
+  List<List<LatLng>> _historicalLines = [];
   StreamSubscription<Position>? _positionSubscription;
 
-  // Navigation state
-  RouteData? _route;
-  RouteProgress? _progress;
-  int _offRouteCount = 0;
-  DateTime? _lastReroute;
-  bool _navigationStarted = false; // New state: waiting for navigation start confirmation
+  bool _navigationStarted = false; // waiting for navigation start confirmation
   bool _isFinishing = false;
 
   String? get _mapTilesUrl {
@@ -81,6 +74,10 @@ class _WorldPageState extends State<WorldPage> {
     _positionSubscription?.cancel();
     super.dispose();
   }
+
+  // ---------------------------------------------------------------------
+  // Location
+  // ---------------------------------------------------------------------
 
   Future<void> _refreshLocation() async {
     setState(() {
@@ -147,167 +144,31 @@ class _WorldPageState extends State<WorldPage> {
       ).listen(_setCurrentPosition);
     } catch (error) {
       if (!mounted) return;
-      setState(() => _error = error.toString().replaceFirst('Exception: ', ''));
+      setState(
+          () => _error = error.toString().replaceFirst('Exception: ', ''));
     } finally {
       if (mounted) setState(() => _loading = false);
     }
   }
 
-  Future<void> _fetchHistoricalTracks() async {
-    try {
-      final userId = Supabase.instance.client.auth.currentUser?.id;
-      if (userId == null) return;
-
-      final dynamic response = await Supabase.instance.client.rpc(
-        'get_user_cleared_geometries',
-        params: {'p_user_id': userId},
-      );
-
-      List<dynamic> geometriesList = [];
-      if (response is List) {
-        if (response.isNotEmpty &&
-            response.first is Map &&
-            response.first.containsKey('get_user_cleared_geometries')) {
-          geometriesList =
-              response.first['get_user_cleared_geometries'] as List? ?? [];
-        } else {
-          geometriesList = response;
-        }
-      } else if (response is Map &&
-          response.containsKey('get_user_cleared_geometries')) {
-        geometriesList =
-            response['get_user_cleared_geometries'] as List? ?? [];
-      }
-
-      final lines = <List<LatLng>>[];
-      for (final item in geometriesList) {
-        if (item is Map) {
-          final points = _parseGeoJsonCoordinates(item['coordinates']);
-          if (points.isNotEmpty) lines.add(points);
-        }
-      }
-      setState(() => _historicalLines = lines);
-      debugPrint('Loaded blue lines count: ${_historicalLines.length}');
-    } catch (e) {
-      debugPrint('Error loading cleared roads: $e');
-    }
-  }
-
-  List<LatLng> _parseGeoJsonCoordinates(dynamic coords) {
-    final result = <LatLng>[];
-    if (coords is! List) return result;
-
-    // Detect if MultiLineString (3 nested levels) or LineString (2 nested levels)
-    final isMulti = coords.isNotEmpty &&
-                    coords.first is List &&
-                    coords.first.isNotEmpty &&
-                    coords.first.first is List;
-
-    void addPt(dynamic pt) {
-      if (pt is List && pt.length >= 2) {
-        final lon = pt[0];
-        final lat = pt[1];
-        if (lon is num && lat is num) {
-          // Flutter latlong2 expects order: (lat, lon)
-          result.add(LatLng(lat.toDouble(), lon.toDouble()));
-        }
-      }
-    }
-
-    if (isMulti) {
-      for (final line in coords) {
-        if (line is List) {
-          for (final pt in line) {
-            addPt(pt);
-          }
-        }
-      }
-    } else {
-      for (final pt in coords) {
-        addPt(pt);
-      }
-    }
-
-    return result;
-  }
-
-  Future<void> _handleTripCompletion() async {
-    if (_isFinishing || _route == null) return;
-    setState(() => _isFinishing = true);
-
-    try {
-      // 1. Get data from existing state in _WorldState
-      final double distanceKm = _actualDrivenMeters / 1000.0;
-      final int durationSeconds = _route!.totalSeconds.round();
-      
-      // _actualTracklog already stores [lat, lon], send directly
-      final tracklogJson = _actualTracklog;
-
-      // 2. Call Supabase RPC function
-      final response = await Supabase.instance.client.rpc(
-        'save_trip_and_calculate_xp',
-        params: {
-          'p_distance_km': distanceKm,
-          'p_duration_seconds': durationSeconds,
-          'p_tracklog': tracklogJson,
-        },
-      );
-
-      debugPrint('Trip finished, RPC result: $response');
-
-      // 3. Immediately load newly created blue lines on the map
-      await _fetchHistoricalTracks();
-
-      // 4. UI state cleanup
-      if (mounted) {
-        _resetNavigation();
-      }
-    } catch (e) {
-      debugPrint('Error finishing trip: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error saving route: $e')),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _isFinishing = false);
-    }
-  }
-
   void _setCurrentPosition(Position position) {
     if (!mounted) return;
-    
+
     final currentLatLng = LatLng(position.latitude, position.longitude);
+
+    if (_navigationStarted || _freeController.isFreeMode) {
+      _tripRecorder.recordPosition(currentLatLng);
+    }
 
     setState(() {
       _currentCoords = currentLatLng;
       if (position.heading >= 0) _heading = position.heading;
-
-      if (_navigationStarted || _freeController.isFreeMode) {
-        if (_lastRecordedPosition != null) {
-          final distance = const Distance().as(
-            LengthUnit.Meter,
-            _lastRecordedPosition!,
-            currentLatLng,
-          );
-          if (distance > 0 && distance < 150) { 
-            _actualDrivenMeters += distance;
-          }
-        }
-        _lastRecordedPosition = currentLatLng;
-
-        if (_lastTracklogLatLng == null ||
-          const Distance().as(LengthUnit.Meter, _lastTracklogLatLng!, currentLatLng) >= _tracklogMinDistanceM) {
-          _actualTracklog.add([currentLatLng.latitude, currentLatLng.longitude]);
-          _lastTracklogLatLng = currentLatLng;
-        }
-      }
     });
 
     if (_mapReady) _mapController.move(_currentCoords!, 15);
     _updateNavigation();
   }
-    
+
   void _moveSimulated(String direction) {
     if (!_useSimulatedLocation) return;
     final headingOffset = switch (direction) {
@@ -320,8 +181,7 @@ class _WorldPageState extends State<WorldPage> {
     final previous = _currentCoords ?? _homeLocation;
     final angle = nextHeading * math.pi / 180;
     final latitudeStep = _simulationStep * math.cos(angle);
-    final longitudeStep =
-        _simulationStep *
+    final longitudeStep = _simulationStep *
         math.sin(angle) /
         math.cos(previous.latitude * math.pi / 180);
     final nextCoords = LatLng(
@@ -329,32 +189,103 @@ class _WorldPageState extends State<WorldPage> {
       previous.longitude + longitudeStep,
     );
 
-    // Calculate and record driven distance
-    final stepDist = const Distance()(previous, nextCoords);
-    _actualDrivenMeters += stepDist;
-
     if (_navigationStarted || _freeController.isFreeMode) {
-      if (_lastTracklogLatLng == null ||
-          const Distance().as(LengthUnit.Meter, _lastTracklogLatLng!, nextCoords) >= _tracklogMinDistanceM) {
-        _actualTracklog.add([nextCoords.latitude, nextCoords.longitude]);
-        _lastTracklogLatLng = nextCoords;
-      }
+      _tripRecorder.recordSimulatedStep(previous, nextCoords);
     }
 
     setState(() {
       _currentCoords = nextCoords;
       _heading = nextHeading;
     });
-    
+
     _updateNavigation();
   }
 
-  Future<void> _openDestinationSearch() async {
-    final origin = _currentCoords ?? _homeLocation;
-    final result = await showDestinationSearch(context, origin: origin);
-    if (result == null || !mounted) return;
-    debugPrint('Selected street: ${result.name} (${result.point})');
-    await _fetchRoute(origin, result.point);
+  // ---------------------------------------------------------------------
+  // Historical tracks
+  // ---------------------------------------------------------------------
+
+  Future<void> _fetchHistoricalTracks() async {
+    try {
+      final lines = await _tracksRepository.fetchHistoricalTracks();
+      if (!mounted) return;
+      setState(() => _historicalLines = lines);
+      debugPrint('Loaded blue lines count: ${_historicalLines.length}');
+    } catch (e) {
+      debugPrint('Error loading cleared roads: $e');
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Trip saving
+  // ---------------------------------------------------------------------
+
+  Future<void> _finishNavigation() async {
+    if (_navController.route == null || _isFinishing) return;
+    _isFinishing = true;
+
+    final distanceKm = _tripRecorder.drivenMeters / 1000.0;
+
+    try {
+      debugPrint(
+        'PAYLOAD CHECK -> distance: $distanceKm, '
+        'duration: ${_navController.route!.totalSeconds}, '
+        'tracklog: ${_tripRecorder.tracklog}',
+      );
+
+      final result = await _tripRepository.saveTrip(
+        distanceKm: distanceKm,
+        durationSeconds: _navController.route!.totalSeconds.round(),
+        tracklog: _tripRecorder.tracklog,
+      );
+
+      if (mounted) {
+        await showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (ctx) => AlertDialog(
+            backgroundColor: AppColors.surface,
+            title: const Text('Trip finished!',
+                style: TextStyle(color: AppColors.white)),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Earned XP: +${result.earnedXp}',
+                    style: const TextStyle(color: AppColors.tealLight)),
+                const SizedBox(height: 6),
+                Text(
+                  'New discovered km: ${result.newClearedKm.toStringAsFixed(2)} km',
+                  style: const TextStyle(color: AppColors.white),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                  _resetNavigation();
+                },
+                child: const Text('OK'),
+              ),
+            ],
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('Error saving trip: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error saving route: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isFinishing = false);
+      } else {
+        _isFinishing = false;
+      }
+    }
   }
 
   void _startFreeModeSession() {
@@ -370,8 +301,8 @@ class _WorldPageState extends State<WorldPage> {
 
     try {
       final response = await _freeController.finishAndSave(
-        actualDrivenMeters: _actualDrivenMeters,
-        actualTracklog: _actualTracklog,
+        actualDrivenMeters: _tripRecorder.drivenMeters,
+        actualTracklog: _tripRecorder.tracklog,
       );
 
       debugPrint('Free mode ended, XP/result: $response');
@@ -383,9 +314,10 @@ class _WorldPageState extends State<WorldPage> {
           barrierDismissible: false,
           builder: (ctx) => AlertDialog(
             backgroundColor: AppColors.surface,
-            title: const Text('Exploration finished!', style: TextStyle(color: AppColors.white)),
+            title: const Text('Exploration finished!',
+                style: TextStyle(color: AppColors.white)),
             content: Text(
-              'Driven ${(_actualDrivenMeters / 1000).toStringAsFixed(2)} km in free mode.',
+              'Driven ${(_tripRecorder.drivenMeters / 1000).toStringAsFixed(2)} km in free mode.',
               style: const TextStyle(color: Colors.white70),
             ),
             actions: [
@@ -420,64 +352,48 @@ class _WorldPageState extends State<WorldPage> {
     await _fetchRoute(start, destination);
   }
 
-  /// Loads route from database. If [reroute] = true, old route remains
-  /// visible until the new one arrives.
+  Future<void> _openDestinationSearch() async {
+    final origin = _currentCoords ?? _homeLocation;
+    final result = await showDestinationSearch(context, origin: origin);
+    if (result == null || !mounted) return;
+    debugPrint('Selected street: ${result.name} (${result.point})');
+    await _fetchRoute(origin, result.point);
+  }
+
+  /// Loads a route from the database. If [reroute] is true, the previous
+  /// route stays visible until the new one arrives.
   Future<void> _fetchRoute(
     LatLng start,
     LatLng destination, {
     bool reroute = false,
   }) async {
-    if (_routeLoading) return;
+    if (_navController.isLoading) return;
 
     setState(() {
-      _routeDestination = destination;
-      _routeLoading = true;
       if (!reroute) {
-        _route = null;
-        _progress = null;
         _routeLines = [];
-        _navigationStarted = false; // Reset start flag on new route
+        _navigationStarted = false;
       }
     });
-    if (reroute) _lastReroute = DateTime.now();
 
     try {
-      final result = await Supabase.instance.client
-          .rpc(
-            'route_with_points_directed',
-            params: {
-              'p_start_lon': start.longitude,
-              'p_start_lat': start.latitude,
-              'p_end_lon': destination.longitude,
-              'p_end_lat': destination.latitude,
-            },
-          )
-          .timeout(const Duration(seconds: 10));
-
-      final rows = result is List ? result.whereType<Map>().toList() : <Map>[];
-      debugPrint('route_with_points_directed returned ${rows.length} rows.');
-
-      final route = RouteData.tryParse(rows);
+      await _navController.fetchRoute(start, destination, reroute: reroute);
       if (!mounted) return;
-
-      if (route == null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Route not found.')),
-        );
-        return;
-      }
-
       setState(() {
-        _route = route;
-        _progress = route.project(start);
-        _routeLines = [route.points];
-        _offRouteCount = 0;
+        _routeLines = [_navController.route!.points];
       });
+      final route = _navController.route!;
       debugPrint(
         'Route: ${formatDistance(route.totalMeters)}, '
         '${formatDuration(route.totalSeconds)}, '
         '${route.maneuvers.length} maneuvers.',
       );
+    } on RouteNotFoundException {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Route not found.')),
+        );
+      }
     } catch (error) {
       debugPrint('Error calling route_with_points_directed: $error');
       if (mounted) {
@@ -486,175 +402,68 @@ class _WorldPageState extends State<WorldPage> {
         );
       }
     } finally {
-      if (mounted) setState(() => _routeLoading = false);
+      if (mounted) setState(() {});
     }
   }
 
   /// Called on every position update.
   void _updateNavigation() {
     if (_freeController.isFreeMode) return;
-    final route = _route;
     final position = _currentCoords;
-    if (route == null || position == null || _routeLoading) return;
+    if (_navController.route == null || position == null) return;
 
-    final progress = route.project(
-      position,
-      hintMeters: _progress?.alongM ?? 0,
-    );
-
-    // Calculate red line trimming behind vehicle if navigation is active
-    List<List<LatLng>> updatedLines = _routeLines;
-    if (_navigationStarted) {
-      int startIndex = 0;
-      for (int i = 0; i < route.cumulative.length; i++) {
-        if (route.cumulative[i] >= progress.alongM) {
-          startIndex = math.max(0, i - 1);
-          break;
-        }
-      }
-      updatedLines = [[progress.snapped, ...route.points.skip(startIndex)]];
-    }
+    final update = _navController.updateForPosition(position);
 
     setState(() {
-      _progress = progress;
       if (_navigationStarted) {
-        _routeLines = updatedLines;
+        _routeLines = [_navController.trimmedRouteLine()];
       }
     });
 
-    // Do not evaluate arrival or rerouting until navigation has been started
+    // Do not evaluate arrival or rerouting until navigation has started.
     if (!_navigationStarted) return;
 
-    if (progress.remainingM < _arrivalThresholdM) {
+    if (update.arrived) {
       _finishNavigation();
       return;
     }
 
-    _offRouteCount = progress.offRouteM > _offRouteThresholdM
-        ? _offRouteCount + 1
-        : 0;
-
-    final destination = _routeDestination;
-    final last = _lastReroute;
-    final cooledDown =
-        last == null || DateTime.now().difference(last) > _rerouteCooldown;
-
-    if (_offRouteCount >= _offRouteUpdates &&
-        destination != null &&
-        cooledDown) {
-      _offRouteCount = 0;
-      debugPrint('Off route (${progress.offRouteM.round()} m), rerouting.');
-      _fetchRoute(position, destination, reroute: true);
-    }
-  }
-
-  Future<void> _finishNavigation() async {
-    if (_route == null || _isFinishing) return;
-    _isFinishing = true;
-    
-    final distanceKm = _actualDrivenMeters / 1000.0;
-    
-    try {
-      debugPrint('PAYLOAD CHECK -> distance: $distanceKm, duration: ${_route!.totalSeconds}, tracklog: $_actualTracklog');
-
-      final response = await Supabase.instance.client.rpc(
-        'save_trip_and_calculate_xp',
-        params: {
-          'p_distance_km': distanceKm,
-          'p_duration_seconds': _route!.totalSeconds.round(),
-          'p_tracklog': _actualTracklog,
-        },
-      );
-
-      int earnedXp = 0;
-      double newClearedKm = 0.0;
-
-      if (response is List && response.isNotEmpty) {
-        final row = response.first;
-        earnedXp = (row['earned_xp'] as num?)?.toInt() ?? 0;
-        newClearedKm = (row['new_cleared_km'] as num?)?.toDouble() ?? 0.0;
-      }
-
-      if (mounted) {
-        await showDialog(
-          context: context,
-          barrierDismissible: false,
-          builder: (ctx) => AlertDialog(
-            backgroundColor: AppColors.surface,
-            title: const Text('Trip finished!', style: TextStyle(color: AppColors.white)),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('Earned XP: +$earnedXp', style: const TextStyle(color: AppColors.tealLight)),
-                const SizedBox(height: 6),
-                Text('New discovered km: ${newClearedKm.toStringAsFixed(2)} km', style: const TextStyle(color: AppColors.white)),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: () {
-                  Navigator.of(ctx).pop(); // close dialog
-                  _resetNavigation(); // clear route and reset state instead of popping root page
-                },
-                child: const Text('OK'),
-              ),
-            ],
-          ),
-        );
-      }
-    } catch (e) {
-      debugPrint('Error saving trip: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error saving route: $e')),
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _isFinishing = false);
-      } else {
-        _isFinishing = false;
+    if (update.shouldReroute) {
+      final destination = _navController.destination;
+      if (destination != null) {
+        debugPrint('Off route, rerouting.');
+        _fetchRoute(position, destination, reroute: true);
       }
     }
   }
 
   void _resetNavigation() {
     setState(() {
-      _route = null;
-      _progress = null;
+      _navController.reset();
       _routeLines = [];
-      _routeDestination = null;
-      _offRouteCount = 0;
       _navigationStarted = false;
       _isFinishing = false;
-      
-      _actualDrivenMeters = 0.0;
-      _lastRecordedPosition = null;
-      _lastTracklogLatLng = null;
-      _actualTracklog.clear();
+      _tripRecorder.reset();
     });
   }
 
   Future<void> _cancelNavigation() async {
-    // If user hasn't started yet or drove less than 300 meters, cancel without prompt
-    if (!_navigationStarted || _actualDrivenMeters < 300) {
+    // If the user hasn't started yet, or drove less than 300 meters, cancel
+    // without prompting.
+    if (!_navigationStarted || _tripRecorder.drivenMeters < 300) {
       _resetNavigation();
       return;
     }
 
-    // If sufficient distance covered, ask user what to do
-    final distanceKm = (_actualDrivenMeters / 1000.0).toStringAsFixed(2);
+    final distanceKm =
+        (_tripRecorder.drivenMeters / 1000.0).toStringAsFixed(2);
 
     final action = await showDialog<String>(
       context: context,
       builder: (context) => AlertDialog(
         backgroundColor: AppColors.surface,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Text(
-          'End trip?',
-          style: TextStyle(color: AppColors.white),
-        ),
+        title: const Text('End trip?', style: TextStyle(color: AppColors.white)),
         content: Text(
           'You traveled $distanceKm km. Do you want to save this portion of the route and claim XP?',
           style: const TextStyle(color: Colors.white70),
@@ -662,12 +471,14 @@ class _WorldPageState extends State<WorldPage> {
         actions: [
           TextButton(
             onPressed: () => Navigator.of(context).pop('discard'),
-            child: const Text('Discard', style: TextStyle(color: AppColors.danger)),
+            child:
+                const Text('Discard', style: TextStyle(color: AppColors.danger)),
           ),
           ElevatedButton(
             onPressed: () => Navigator.of(context).pop('save'),
             style: ElevatedButton.styleFrom(backgroundColor: AppColors.teal),
-            child: const Text('Save & Claim XP', style: TextStyle(color: AppColors.background)),
+            child: const Text('Save & Claim XP',
+                style: TextStyle(color: AppColors.background)),
           ),
         ],
       ),
@@ -682,17 +493,18 @@ class _WorldPageState extends State<WorldPage> {
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) return const _WorldLoading();
+    if (_loading) return const WorldLoading();
     if (_error != null || _mapTilesUrl == null) {
-      return _WorldError(
+      return WorldError(
         message: _error ?? 'MapTiler URL or key is missing',
         onRetry: _refreshLocation,
       );
     }
 
     final markerPosition = _currentCoords ?? _homeLocation;
-    final route = _route;
-    final progress = _progress;
+    final route = _navController.route;
+    final progress = _navController.progress;
+    final routeDestination = _navController.destination;
 
     return Scaffold(
       body: Stack(
@@ -748,9 +560,9 @@ class _WorldPageState extends State<WorldPage> {
                       ),
                     ),
                   ),
-                  if (_routeDestination != null)
+                  if (routeDestination != null)
                     Marker(
-                      point: _routeDestination!,
+                      point: routeDestination,
                       width: 32,
                       height: 32,
                       child: const Icon(
@@ -763,11 +575,10 @@ class _WorldPageState extends State<WorldPage> {
               ),
             ],
           ),
-          
           Positioned(
             top: MediaQuery.paddingOf(context).top + 12,
             right: 20,
-            child: _MapButton(
+            child: MapButton(
               icon: Icons.directions,
               onPressed: _openDestinationSearch,
             ),
@@ -775,101 +586,109 @@ class _WorldPageState extends State<WorldPage> {
           Positioned(
             top: MediaQuery.paddingOf(context).top + 70,
             right: 20,
-            child: _MapButton(
+            child: MapButton(
               icon: _freeController.isFreeMode ? Icons.stop : Icons.explore,
               onPressed: _freeController.isFreeMode
                   ? _handleFreeModeCompletion
                   : _startFreeModeSession,
             ),
           ),
-          // Show top navigation panel only if navigation has started
+          // Top navigation panel, only once navigation has started.
           if (route != null && progress != null && _navigationStarted)
             Positioned(
               top: MediaQuery.paddingOf(context).top + 12,
               left: 16,
               right: 84,
-              child: _NavigationPanel(
+              child: NavigationPanel(
                 progress: progress,
-                offRoute: progress.offRouteM > _offRouteThresholdM,
-                rerouting: _routeLoading,
+                offRoute: progress.offRouteM > _navController.offRouteThresholdM,
+                rerouting: _navController.isLoading,
                 onCancel: _cancelNavigation,
               ),
             ),
-            
-          if (_routeLoading)
+
+          if (_navController.isLoading)
             Positioned(
               top: MediaQuery.paddingOf(context).top + 110,
               left: 20,
               child: const CircularProgressIndicator(color: Colors.red),
             ),
-            
-          // Hide D-Pad and location controls during route preview mode
-          if (_route == null || _navigationStarted) ...[
+
+          // Hide D-Pad and location controls during route preview mode.
+          if (route == null || _navigationStarted) ...[
             Positioned(
               left: 16,
               bottom: 24,
-              child: _DebugDPad(onMove: _moveSimulated),
+              child: DebugDPad(onMove: _moveSimulated),
             ),
-            
             if (_freeController.isFreeMode)
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
-              child: Align(
-                alignment: Alignment.bottomCenter,
-                child: Material(
-                  color: AppColors.surface,
-                  elevation: 16,
-                  borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-                  child: SafeArea(
-                    top: false,
-                    child: Padding(
-                      padding: const EdgeInsets.fromLTRB(20, 24, 20, 16),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          const Text(
-                            'Free City Exploration',
-                            style: TextStyle(color: AppColors.white, fontSize: 18, fontWeight: FontWeight.bold),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            'Traveled: ${(_actualDrivenMeters / 1000).toStringAsFixed(2)} km',
-                            style: const TextStyle(color: Colors.white70, fontSize: 14),
-                          ),
-                          const SizedBox(height: 24),
-                          ElevatedButton(
-                            onPressed: _handleFreeModeCompletion,
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: AppColors.teal,
-                              foregroundColor: AppColors.background,
-                              padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 32),
-                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                child: Align(
+                  alignment: Alignment.bottomCenter,
+                  child: Material(
+                    color: AppColors.surface,
+                    elevation: 16,
+                    borderRadius:
+                        const BorderRadius.vertical(top: Radius.circular(24)),
+                    child: SafeArea(
+                      top: false,
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(20, 24, 20, 16),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Text(
+                              'Free City Exploration',
+                              style: TextStyle(
+                                color: AppColors.white,
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                              ),
                             ),
-                            child: const Text('End Exploration', style: TextStyle(fontWeight: FontWeight.bold)),
-                          ),
-                        ],
+                            const SizedBox(height: 8),
+                            Text(
+                              'Traveled: ${(_tripRecorder.drivenMeters / 1000).toStringAsFixed(2)} km',
+                              style: const TextStyle(
+                                  color: Colors.white70, fontSize: 14),
+                            ),
+                            const SizedBox(height: 24),
+                            ElevatedButton(
+                              onPressed: _handleFreeModeCompletion,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: AppColors.teal,
+                                foregroundColor: AppColors.background,
+                                padding: const EdgeInsets.symmetric(
+                                    vertical: 16, horizontal: 32),
+                                shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(16)),
+                              ),
+                              child: const Text('End Exploration',
+                                  style: TextStyle(fontWeight: FontWeight.bold)),
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ),
                 ),
               ),
-            ),
           ],
 
-          // Show bottom sheet for route preview and XP estimation (before start)
+          // Route preview / XP estimate, before navigation is started.
           if (route != null && !_navigationStarted)
             Positioned(
               left: 0,
               right: 0,
               bottom: 0,
-              child: _RouteSummaryPanel(
+              child: RouteSummaryPanel(
                 route: route,
                 onStart: () {
                   setState(() => _navigationStarted = true);
                   if (_currentCoords != null && _mapReady) {
-                    _mapController.move(_currentCoords!, 17); // Zoom closer on start
+                    _mapController.move(_currentCoords!, 17); // Zoom in
                   }
                 },
                 onCancel: _cancelNavigation,
@@ -888,357 +707,4 @@ class _WorldPageState extends State<WorldPage> {
       ),
     );
   }
-}
-
-// ---------------------------------------------------------------------
-// Map UI widgets
-// ---------------------------------------------------------------------
-
-class _RouteSummaryPanel extends StatelessWidget {
-  const _RouteSummaryPanel({
-    required this.route,
-    required this.onStart,
-    required this.onCancel,
-  });
-
-  final RouteData route;
-  final VoidCallback onStart;
-  final VoidCallback onCancel;
-
-  @override
-  Widget build(BuildContext context) {
-    // Estimated XP calculation: min = 1 XP/km (traveled all), max = 2 XP/km (all new)
-    final distanceKm = route.totalMeters / 1000;
-    final minXp = (distanceKm * 1).round();
-    final maxXp = (distanceKm * 2).round();
-
-    return Align(
-      alignment: Alignment.bottomCenter,
-      child: Material(
-        color: AppColors.surface,
-        elevation: 16,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-        child: SafeArea(
-          top: false,
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(20, 24, 20, 16),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceAround,
-                  children: [
-                    _SummaryItem(
-                      icon: Icons.route,
-                      value: formatDistance(route.totalMeters),
-                      label: 'Distance',
-                    ),
-                    _SummaryItem(
-                      icon: Icons.timer,
-                      value: formatDuration(route.totalSeconds),
-                      label: 'Estimate',
-                    ),
-                    _SummaryItem(
-                      icon: Icons.star_rounded,
-                      value: '$minXp - $maxXp XP',
-                      label: 'Reward',
-                      iconColor: Colors.amber,
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 24),
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton(
-                        onPressed: onCancel,
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: AppColors.white,
-                          side: const BorderSide(color: Colors.white24),
-                          padding: const EdgeInsets.symmetric(vertical: 16),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(16),
-                          ),
-                        ),
-                        child: const Text('Cancel'),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      flex: 2,
-                      child: ElevatedButton(
-                        onPressed: onStart,
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: AppColors.teal,
-                          foregroundColor: AppColors.background,
-                          padding: const EdgeInsets.symmetric(vertical: 16),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(16),
-                          ),
-                        ),
-                        child: const Text(
-                          'Start Navigation',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _SummaryItem extends StatelessWidget {
-  const _SummaryItem({
-    required this.icon,
-    required this.value,
-    required this.label,
-    this.iconColor = AppColors.teal,
-  });
-
-  final IconData icon;
-  final String value;
-  final String label;
-  final Color iconColor;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(icon, color: iconColor, size: 28),
-        const SizedBox(height: 8),
-        Text(
-          value,
-          style: const TextStyle(
-            color: AppColors.white,
-            fontSize: 16,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-        const SizedBox(height: 4),
-        Text(
-          label,
-          style: const TextStyle(color: Colors.white60, fontSize: 12),
-        ),
-      ],
-    );
-  }
-}
-
-class _NavigationPanel extends StatelessWidget {
-  const _NavigationPanel({
-    required this.progress,
-    required this.offRoute,
-    required this.rerouting,
-    required this.onCancel,
-  });
-
-  final RouteProgress progress;
-  final bool offRoute;
-  final bool rerouting;
-  final VoidCallback onCancel;
-
-  static IconData _iconFor(TurnType type) => switch (type) {
-    TurnType.depart => Icons.straight,
-    TurnType.straight => Icons.straight,
-    TurnType.slightLeft => Icons.turn_slight_left,
-    TurnType.left => Icons.turn_left,
-    TurnType.sharpLeft => Icons.turn_sharp_left,
-    TurnType.slightRight => Icons.turn_slight_right,
-    TurnType.right => Icons.turn_right,
-    TurnType.sharpRight => Icons.turn_sharp_right,
-    TurnType.uTurn => Icons.u_turn_left,
-    TurnType.arrive => Icons.flag,
-  };
-
-  @override
-  Widget build(BuildContext context) {
-    final next = progress.next;
-    final title = next == null
-        ? 'You have arrived'
-        : '${formatDistance(progress.toNextM)} · ${next.text}';
-    final status = offRoute || rerouting
-        ? 'Off route, rerouting…'
-        : 'Remaining ${formatDistance(progress.remainingM)} · '
-              '${formatDuration(progress.remainingS)}';
-
-    return Material(
-      color: AppColors.surface.withValues(alpha: 0.95),
-      elevation: 6,
-      borderRadius: BorderRadius.circular(16),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(14, 12, 6, 12),
-        child: Row(
-          children: [
-            Icon(
-              _iconFor(next?.type ?? TurnType.arrive),
-              color: AppColors.teal,
-              size: 36,
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    title,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      color: AppColors.white,
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    status,
-                    style: const TextStyle(color: Colors.white70, fontSize: 13),
-                  ),
-                ],
-              ),
-            ),
-            IconButton(
-              onPressed: onCancel,
-              icon: const Icon(Icons.close, color: AppColors.white),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _MapButton extends StatelessWidget {
-  const _MapButton({this.label, this.icon, required this.onPressed});
-
-  final String? label;
-  final IconData? icon;
-  final VoidCallback? onPressed;
-
-  @override
-  Widget build(BuildContext context) => Material(
-    color: AppColors.white,
-    elevation: 4,
-    shape: const CircleBorder(),
-    child: InkWell(
-      onTap: onPressed,
-      customBorder: const CircleBorder(),
-      child: SizedBox(
-        width: 48,
-        height: 48,
-        child: Center(
-          child: icon != null
-              ? Icon(icon, color: AppColors.teal)
-              : Text(
-                  label!,
-                  style: const TextStyle(
-                    color: AppColors.teal,
-                    fontSize: 22,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-        ),
-      ),
-    ),
-  );
-}
-
-class _DebugDPad extends StatelessWidget {
-  const _DebugDPad({required this.onMove});
-
-  final ValueChanged<String> onMove;
-
-  @override
-  Widget build(BuildContext context) => Column(
-    children: [
-      _DPadButton(icon: Icons.keyboard_arrow_up, onPressed: () => onMove('up')),
-      Row(
-        children: [
-          _DPadButton(
-            icon: Icons.keyboard_arrow_left,
-            onPressed: () => onMove('left'),
-          ),
-          const SizedBox(width: 4),
-          _DPadButton(
-            icon: Icons.keyboard_arrow_right,
-            onPressed: () => onMove('right'),
-          ),
-        ],
-      ),
-      _DPadButton(
-        icon: Icons.keyboard_arrow_down,
-        onPressed: () => onMove('down'),
-      ),
-    ],
-  );
-}
-
-class _DPadButton extends StatelessWidget {
-  const _DPadButton({required this.icon, required this.onPressed});
-
-  final IconData icon;
-  final VoidCallback onPressed;
-
-  @override
-  Widget build(BuildContext context) => SizedBox(
-    width: 42,
-    height: 36,
-    child: IconButton(
-      onPressed: onPressed,
-      icon: Icon(icon, color: AppColors.white),
-      style: IconButton.styleFrom(
-        backgroundColor: AppColors.surface.withValues(alpha: 0.9),
-      ),
-    ),
-  );
-}
-
-class _WorldLoading extends StatelessWidget {
-  const _WorldLoading();
-
-  @override
-  Widget build(BuildContext context) => const Scaffold(
-    backgroundColor: AppColors.background,
-    body: Center(child: CircularProgressIndicator(color: AppColors.teal)),
-  );
-}
-
-class _WorldError extends StatelessWidget {
-  const _WorldError({required this.message, required this.onRetry});
-
-  final String message;
-  final VoidCallback onRetry;
-
-  @override
-  Widget build(BuildContext context) => Scaffold(
-    backgroundColor: AppColors.background,
-    body: Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              message,
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: AppColors.danger),
-            ),
-            const SizedBox(height: 16),
-            ElevatedButton(onPressed: onRetry, child: const Text('Retry')),
-          ],
-        ),
-      ),
-    ),
-  );
 }
