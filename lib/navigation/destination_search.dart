@@ -19,10 +19,13 @@ class StreetResult {
     required this.roadType,
     required this.point,
     required this.distanceM,
+    this.routePoint,
   });
 
   final String name;
   final String roadType;
+  /// Point on the road.
+  final LatLng? routePoint;  //where to route (road near house)
 
   /// Destination point (lies on the road).
   final LatLng point;
@@ -114,9 +117,11 @@ class _DestinationSearchState extends State<_DestinationSearch> {
     setState(() => _loading = true);
 
     try {
+
+      final looksLikeAddress = RegExp(r'^.+?[\s,]+\d+[A-Za-z]?$').hasMatch(query);
       final response = await Supabase.instance.client
           .rpc(
-            'search_streets',
+            looksLikeAddress ? 'search_addresses' : 'search_streets',
             params: {
               'p_query': query,
               'p_lon': widget.origin.longitude,
@@ -134,15 +139,19 @@ class _DestinationSearchState extends State<_DestinationSearch> {
           if (row is! Map) continue;
           final lon = row['lon'];
           final lat = row['lat'];
-          if (lon is! num || lat is! num) continue;
+          final rLon = row['route_lon'];
+          final rLat = row['route_lat'];
           results.add(
             StreetResult(
               name: (row['name'] ?? '').toString(),
               roadType: (row['road_type'] ?? '').toString(),
               point: LatLng(lat.toDouble(), lon.toDouble()),
+              routePoint: (rLon is num && rLat is num)
+                  ? LatLng(rLat.toDouble(), rLon.toDouble())
+                  : null,
               distanceM: (row['distance_m'] as num?)?.toDouble() ?? 0,
             ),
-          );
+);
         }
       }
 

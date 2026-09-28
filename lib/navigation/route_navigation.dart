@@ -391,8 +391,8 @@ List<LatLng> parseGeometry(dynamic geometry) {
 }
 
 LatLng? _toLatLng(dynamic c) {
-  if (c is! List || c.length < 2 || c[0] is! num || c is! num) return null;
-  return LatLng((c as num).toDouble(), (c[0] as num).toDouble());
+  if (c is! List || c.length < 2 || c[0] is! num || c[1] is! num) return null;
+  return LatLng((c[1] as num).toDouble(), (c[0] as num).toDouble());
 }
 
 /// 180 -> "180 m", 1450 -> "1.5 km"

@@ -1,4 +1,4 @@
-// lib/screens/world.dart
+// lib/navigation/world.dart
 
 import 'dart:async';
 import 'dart:math' as math;
@@ -18,6 +18,7 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import '../ui/world_controls.dart';
 
 class WorldPage extends StatefulWidget {
@@ -51,6 +52,10 @@ class _WorldPageState extends State<WorldPage> {
 
   bool _navigationStarted = false; // waiting for navigation start confirmation
   bool _isFinishing = false;
+
+  // Whether the camera should keep re-centering on the user's marker.
+  // Turned off automatically as soon as the user drags/pinches the map.
+  bool _followUser = true;
 
   String? get _mapTilesUrl {
     final styleUrl = dotenv.env['PUBLIC_MAPTILER_DARK_TILE_URL'];
@@ -165,8 +170,16 @@ class _WorldPageState extends State<WorldPage> {
       if (position.heading >= 0) _heading = position.heading;
     });
 
-    if (_mapReady) _mapController.move(_currentCoords!, 15);
+    if (_mapReady && _followUser) _mapController.move(_currentCoords!, 15);
     _updateNavigation();
+  }
+
+  /// Re-centers the camera on the user's marker and turns following back on.
+  void _toggleFollowUser() {
+    setState(() => _followUser = !_followUser);
+    if (_followUser && _currentCoords != null && _mapReady) {
+      _mapController.move(_currentCoords!, _mapController.camera.zoom);
+    }
   }
 
   void _moveSimulated(String direction) {
@@ -197,6 +210,10 @@ class _WorldPageState extends State<WorldPage> {
       _currentCoords = nextCoords;
       _heading = nextHeading;
     });
+    
+    if (_mapReady && _followUser) {
+      _mapController.move(_currentCoords!, _mapController.camera.zoom);
+    }
 
     _updateNavigation();
   }
@@ -220,6 +237,41 @@ class _WorldPageState extends State<WorldPage> {
   // Trip saving
   // ---------------------------------------------------------------------
 
+  // NOTE: this doesn't appear to be called anywhere else in the app right
+  // now (superseded by `_finishNavigation`). Kept during the refactor since
+  // it may still be wired up elsewhere — worth confirming and removing if
+  // it's genuinely dead.
+  Future<void> _handleTripCompletion() async {
+    if (_isFinishing || _navController.route == null) return;
+    setState(() => _isFinishing = true);
+
+    try {
+      final distanceKm = _tripRecorder.drivenMeters / 1000.0;
+      final durationSeconds = _navController.route!.totalSeconds.round();
+
+      final response = await _tripRepository.saveTrip(
+        distanceKm: distanceKm,
+        durationSeconds: durationSeconds,
+        tracklog: _tripRecorder.tracklog,
+      );
+
+      debugPrint('Trip finished, RPC result: $response');
+
+      await _fetchHistoricalTracks();
+
+      if (mounted) _resetNavigation();
+    } catch (e) {
+      debugPrint('Error finishing trip: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error saving route: $e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isFinishing = false);
+    }
+  }
+
   Future<void> _finishNavigation() async {
     if (_navController.route == null || _isFinishing) return;
     _isFinishing = true;
@@ -238,6 +290,7 @@ class _WorldPageState extends State<WorldPage> {
         durationSeconds: _navController.route!.totalSeconds.round(),
         tracklog: _tripRecorder.tracklog,
       );
+      await _fetchHistoricalTracks();
 
       if (mounted) {
         await showDialog(
@@ -356,8 +409,8 @@ class _WorldPageState extends State<WorldPage> {
     final origin = _currentCoords ?? _homeLocation;
     final result = await showDestinationSearch(context, origin: origin);
     if (result == null || !mounted) return;
-    debugPrint('Selected street: ${result.name} (${result.point})');
-    await _fetchRoute(origin, result.point);
+    debugPrint('Selected: ${result.name} (${result.point})');
+    await _fetchRoute(origin, result.routePoint ?? result.point);
   }
 
   /// Loads a route from the database. If [reroute] is true, the previous
@@ -515,6 +568,14 @@ class _WorldPageState extends State<WorldPage> {
               initialCenter: _homeLocation,
               initialZoom: 15,
               onTap: _onMapTap,
+              onPositionChanged: (camera, hasGesture) {
+                // Only user-driven drags/pinches (hasGesture == true) should
+                // break the follow lock — our own _mapController.move calls
+                // report hasGesture == false.
+                if (hasGesture && _followUser) {
+                  setState(() => _followUser = false);
+                }
+              },
               onMapReady: () {
                 _mapReady = true;
                 if (_currentCoords != null) {
@@ -591,6 +652,14 @@ class _WorldPageState extends State<WorldPage> {
               onPressed: _freeController.isFreeMode
                   ? _handleFreeModeCompletion
                   : _startFreeModeSession,
+            ),
+          ),
+          Positioned(
+            top: MediaQuery.paddingOf(context).top + 128,
+            right: 20,
+            child: MapButton(
+              icon: _followUser ? Icons.gps_fixed : Icons.gps_not_fixed,
+              onPressed: _toggleFollowUser,
             ),
           ),
           // Top navigation panel, only once navigation has started.
