@@ -1,8 +1,4 @@
 // lib/navigation/destination_search.dart
-//
-// Top-sheet search popup. User enters a street name,
-// results are fetched from the database (RPC search_streets) and sorted
-// by distance from the user.
 
 import 'dart:async';
 import 'dart:math' as math;
@@ -20,24 +16,25 @@ class StreetResult {
     required this.point,
     required this.distanceM,
     this.routePoint,
+    this.avoidMotorways = false,
+    this.avoidTolls = false,
   });
 
   final String name;
   final String roadType;
-  /// Point on the road.
-  final LatLng? routePoint;  //where to route (road near house)
-
-  /// Destination point (lies on the road).
+  final LatLng? routePoint;
   final LatLng point;
-
-  /// Distance from the user in meters.
   final double distanceM;
+  final bool avoidMotorways;
+  final bool avoidTolls;
 }
 
-/// Opens the top popup. Returns the selected street, or null if closed by the user.
+/// Opens the top popup with initial motorway and toll preferences.
 Future<StreetResult?> showDestinationSearch(
   BuildContext context, {
   required LatLng origin,
+  bool initialAvoidMotorways = false,
+  bool initialAvoidTolls = false,
 }) {
   return showGeneralDialog<StreetResult>(
     context: context,
@@ -45,8 +42,11 @@ Future<StreetResult?> showDestinationSearch(
     barrierLabel: 'Zavrieť',
     barrierColor: Colors.black54,
     transitionDuration: const Duration(milliseconds: 250),
-    pageBuilder: (context, animation, secondaryAnimation) =>
-        _DestinationSearch(origin: origin),
+    pageBuilder: (context, animation, secondaryAnimation) => _DestinationSearch(
+      origin: origin,
+      initialAvoidMotorways: initialAvoidMotorways,
+      initialAvoidTolls: initialAvoidTolls,
+    ),
     transitionBuilder: (context, animation, secondaryAnimation, child) {
       final curved = CurvedAnimation(
         parent: animation,
@@ -65,9 +65,15 @@ Future<StreetResult?> showDestinationSearch(
 }
 
 class _DestinationSearch extends StatefulWidget {
-  const _DestinationSearch({required this.origin});
+  const _DestinationSearch({
+    required this.origin,
+    required this.initialAvoidMotorways,
+    required this.initialAvoidTolls,
+  });
 
   final LatLng origin;
+  final bool initialAvoidMotorways;
+  final bool initialAvoidTolls;
 
   @override
   State<_DestinationSearch> createState() => _DestinationSearchState();
@@ -76,12 +82,22 @@ class _DestinationSearch extends StatefulWidget {
 class _DestinationSearchState extends State<_DestinationSearch> {
   final _controller = TextEditingController();
   Timer? _debounce;
-  int _requestId = 0; // prevents older responses from overwriting newer ones
+  int _requestId = 0;
 
   String _query = '';
   List<StreetResult> _results = [];
   bool _loading = false;
   String? _error;
+
+  late bool _avoidMotorways;
+  late bool _avoidTolls;
+
+  @override
+  void initState() {
+    super.initState();
+    _avoidMotorways = widget.initialAvoidMotorways;
+    _avoidTolls = widget.initialAvoidTolls;
+  }
 
   @override
   void dispose() {
@@ -95,7 +111,7 @@ class _DestinationSearchState extends State<_DestinationSearch> {
     final query = value.trim();
 
     if (query.length < 2) {
-      _requestId++; // cancel any ongoing search
+      _requestId++;
       setState(() {
         _query = query;
         _results = [];
@@ -117,8 +133,8 @@ class _DestinationSearchState extends State<_DestinationSearch> {
     setState(() => _loading = true);
 
     try {
-
-      final looksLikeAddress = RegExp(r'^.+?[\s,]+\d+[A-Za-z]?$').hasMatch(query);
+      final looksLikeAddress =
+          RegExp(r'^.+?[\s,]+\d+[A-Za-z]?$').hasMatch(query);
       final response = await Supabase.instance.client
           .rpc(
             looksLikeAddress ? 'search_addresses' : 'search_streets',
@@ -151,7 +167,7 @@ class _DestinationSearchState extends State<_DestinationSearch> {
                   : null,
               distanceM: (row['distance_m'] as num?)?.toDouble() ?? 0,
             ),
-);
+          );
         }
       }
 
@@ -169,15 +185,26 @@ class _DestinationSearchState extends State<_DestinationSearch> {
     }
   }
 
-  void _select(StreetResult result) => Navigator.of(context).pop(result);
+  void _select(StreetResult result) {
+    Navigator.of(context).pop(
+      StreetResult(
+        name: result.name,
+        roadType: result.roadType,
+        point: result.point,
+        distanceM: result.distanceM,
+        routePoint: result.routePoint,
+        avoidMotorways: _avoidMotorways,
+        avoidTolls: _avoidTolls,
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final media = MediaQuery.of(context);
-    // Remaining screen space above keyboard to ensure list never overflows.
     final maxListHeight = math.max(
       120.0,
-      media.size.height - media.viewInsets.bottom - media.padding.top - 140,
+      media.size.height - media.viewInsets.bottom - media.padding.top - 180,
     );
 
     return Align(
@@ -243,6 +270,55 @@ class _DestinationSearchState extends State<_DestinationSearch> {
                     ),
                   ],
                 ),
+
+                // Tlačidlá pre možnosti vyhýbania sa diaľniciam a mýtu
+                Padding(
+                  padding: const EdgeInsets.only(top: 8, right: 8),
+                  child: Row(
+                    children: [
+                      FilterChip(
+                        selected: _avoidMotorways,
+                        label: const Text('Avoid motorways',
+                            style: TextStyle(color: AppColors.white, fontSize: 12)),
+                        avatar: Icon(
+                          _avoidMotorways ? Icons.alt_route : Icons.add_road,
+                          color: _avoidMotorways ? AppColors.teal : Colors.white54,
+                          size: 16,
+                        ),
+                        backgroundColor: AppColors.background,
+                        selectedColor: AppColors.surface,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(20),
+                          side: BorderSide(
+                            color: _avoidMotorways ? AppColors.teal : Colors.transparent,
+                          ),
+                        ),
+                        onSelected: (val) => setState(() => _avoidMotorways = val),
+                      ),
+                      const SizedBox(width: 8),
+                      FilterChip(
+                        selected: _avoidTolls,
+                        label: const Text('Avoid tolls',
+                            style: TextStyle(color: AppColors.white, fontSize: 12)),
+                        avatar: Icon(
+                          _avoidTolls ? Icons.money_off : Icons.toll,
+                          color: _avoidTolls ? AppColors.teal : Colors.white54,
+                          size: 16,
+                        ),
+                        backgroundColor: AppColors.background,
+                        selectedColor: AppColors.surface,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(20),
+                          side: BorderSide(
+                            color: _avoidTolls ? AppColors.teal : Colors.transparent,
+                          ),
+                        ),
+                        onSelected: (val) => setState(() => _avoidTolls = val),
+                      ),
+                    ],
+                  ),
+                ),
+
                 if (_loading)
                   const Padding(
                     padding: EdgeInsets.only(top: 8, right: 8),

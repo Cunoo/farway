@@ -53,6 +53,9 @@ class _WorldPageState extends State<WorldPage> {
   bool _navigationStarted = false; // waiting for navigation start confirmation
   bool _isFinishing = false;
 
+  bool _avoidMotorways = false;
+  bool _avoidTolls = false;
+
   // Whether the camera should keep re-centering on the user's marker.
   // Turned off automatically as soon as the user drags/pinches the map.
   bool _followUser = true;
@@ -237,40 +240,6 @@ class _WorldPageState extends State<WorldPage> {
   // Trip saving
   // ---------------------------------------------------------------------
 
-  // NOTE: this doesn't appear to be called anywhere else in the app right
-  // now (superseded by `_finishNavigation`). Kept during the refactor since
-  // it may still be wired up elsewhere — worth confirming and removing if
-  // it's genuinely dead.
-  Future<void> _handleTripCompletion() async {
-    if (_isFinishing || _navController.route == null) return;
-    setState(() => _isFinishing = true);
-
-    try {
-      final distanceKm = _tripRecorder.drivenMeters / 1000.0;
-      final durationSeconds = _navController.route!.totalSeconds.round();
-
-      final response = await _tripRepository.saveTrip(
-        distanceKm: distanceKm,
-        durationSeconds: durationSeconds,
-        tracklog: _tripRecorder.tracklog,
-      );
-
-      debugPrint('Trip finished, RPC result: $response');
-
-      await _fetchHistoricalTracks();
-
-      if (mounted) _resetNavigation();
-    } catch (e) {
-      debugPrint('Error finishing trip: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Error saving route: $e')),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _isFinishing = false);
-    }
-  }
 
   Future<void> _finishNavigation() async {
     if (_navController.route == null || _isFinishing) return;
@@ -407,8 +376,22 @@ class _WorldPageState extends State<WorldPage> {
 
   Future<void> _openDestinationSearch() async {
     final origin = _currentCoords ?? _homeLocation;
-    final result = await showDestinationSearch(context, origin: origin);
+    
+    final result = await showDestinationSearch(
+      context,
+      origin: origin,
+      initialAvoidMotorways: _avoidMotorways,
+      initialAvoidTolls: _avoidTolls,
+    );
+
     if (result == null || !mounted) return;
+
+    // Aktualizujeme stav vyhýbania sa podľa toho, čo používateľ zvolil vo vyhľadávaní
+    setState(() {
+      _avoidMotorways = result.avoidMotorways;
+      _avoidTolls = result.avoidTolls;
+    });
+
     debugPrint('Selected: ${result.name} (${result.point})');
     await _fetchRoute(origin, result.routePoint ?? result.point);
   }
@@ -430,7 +413,7 @@ class _WorldPageState extends State<WorldPage> {
     });
 
     try {
-      await _navController.fetchRoute(start, destination, reroute: reroute);
+      await _navController.fetchRoute(start, destination, reroute: reroute, avoidMotorways: _avoidMotorways, avoidTolls: _avoidTolls);
       if (!mounted) return;
       setState(() {
         _routeLines = [_navController.route!.points];
@@ -739,39 +722,152 @@ class _WorldPageState extends State<WorldPage> {
                             ),
                           ],
                         ),
+                        
                       ),
                     ),
                   ),
                 ),
               ),
-          ],
-
-          // Route preview / XP estimate, before navigation is started.
-          if (route != null && !_navigationStarted)
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
-              child: RouteSummaryPanel(
-                route: route,
-                onStart: () {
-                  setState(() => _navigationStarted = true);
-                  if (_currentCoords != null && _mapReady) {
-                    _mapController.move(_currentCoords!, 17); // Zoom in
-                  }
-                },
-                onCancel: _cancelNavigation,
-              ),
-            ),
-
-          const Positioned(
-            left: 8,
-            bottom: 8,
-            child: Text(
-              '© MapTiler © OpenStreetMap',
-              style: TextStyle(color: Colors.white, fontSize: 10),
-            ),
-          ),
+              // Spodný panel počas aktívnej navigácie (s tlačidlom na zrušenie/ukončenie)
+              if (_navigationStarted && route != null)
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: Align(
+                    alignment: Alignment.bottomCenter,
+                    child: Material(
+                      color: AppColors.surface,
+                      elevation: 16,
+                      borderRadius:
+                          const BorderRadius.vertical(top: Radius.circular(24)),
+                      child: SafeArea(
+                        top: false,
+                        child: Padding(
+                          padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Text(
+                                      'Navigation',
+                                      style: TextStyle(
+                                        color: AppColors.white,
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      'Distance: ${(_tripRecorder.drivenMeters / 1000).toStringAsFixed(2)} km',
+                                      style: const TextStyle(
+                                        color: Colors.white70,
+                                        fontSize: 13,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              ElevatedButton(
+                                onPressed: _cancelNavigation,
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: AppColors.danger,
+                                  foregroundColor: AppColors.white,
+                                  padding: const EdgeInsets.symmetric(
+                                      vertical: 12, horizontal: 20),
+                                  shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(12)),
+                                ),
+                                child: const Text(
+                                  'Cancel',
+                                  style: TextStyle(fontWeight: FontWeight.bold),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+              // Route preview / XP estimate, before navigation is started.
+              if (route != null && !_navigationStarted)
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Filter toggles above the route preview
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: AppColors.surface.withValues(alpha: 0.95),
+                          borderRadius: const BorderRadius.vertical(top: Radius.circular(16)),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            FilterChip(
+                              label: const Text(
+                                'Avoid highways',
+                                style: TextStyle(color: Colors.white, fontSize: 13),
+                              ),
+                              selected: _avoidMotorways,
+                              selectedColor: AppColors.teal,
+                              backgroundColor: AppColors.background,
+                              checkmarkColor: AppColors.background,
+                              onSelected: (val) {
+                                setState(() => _avoidMotorways = val);
+                                final start = _currentCoords ?? _homeLocation;
+                                final dest = _navController.destination;
+                                if (dest != null) {
+                                  _fetchRoute(start, dest, reroute: true);
+                                }
+                              },
+                            ),
+                            const SizedBox(width: 12),
+                            FilterChip(
+                              label: const Text(
+                                'Avoid tolls',
+                                style: TextStyle(color: Colors.white, fontSize: 13),
+                              ),
+                              selected: _avoidTolls,
+                              selectedColor: AppColors.teal,
+                              backgroundColor: AppColors.background,
+                              checkmarkColor: AppColors.background,
+                              onSelected: (val) {
+                                setState(() => _avoidTolls = val);
+                                final start = _currentCoords ?? _homeLocation;
+                                final dest = _navController.destination;
+                                if (dest != null) {
+                                  _fetchRoute(start, dest, reroute: true);
+                                }
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                      
+                      // Pôvodný panel s prehľadom
+                      RouteSummaryPanel(
+                        route: route,
+                        onStart: () {
+                          setState(() => _navigationStarted = true);
+                          if (_currentCoords != null && _mapReady) {
+                            _mapController.move(_currentCoords!, 17); // Zoom in
+                          }
+                        },
+                        onCancel: _cancelNavigation,
+                      ),
+                    ],
+                  ),
+                ),
         ],
       ),
     );
